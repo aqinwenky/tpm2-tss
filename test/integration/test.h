@@ -1,4 +1,7 @@
-#include "sapi/tpm20.h"
+#include "tss2_sys.h"
+
+#define YES 1
+#define NO  0
 
 /*
  * This is the prototype for all integration tests in the tpm2-tss
@@ -9,4 +12,4 @@
  * Return values:
  * A successful test will return 0, any other value indicates failure.
  */
-int test_invoke (TSS2_SYS_CONTEXT *sapi_context);
+int test_invoke(TSS2_SYS_CONTEXT * sapi_context);

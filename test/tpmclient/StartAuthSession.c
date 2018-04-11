@@ -25,10 +25,16 @@
 // THE POSSIBILITY OF SUCH DAMAGE.
 //**********************************************************************;
 
-#include "sapi/tpm20.h"
-#include "sample.h"
-#include "../integration/sapi-util.h"
 #include <stdlib.h>
+
+#include "tss2_sys.h"
+#include "sysapi_util.h"
+
+#include "tpmclient.int.h"
+#include "../integration/context-util.h"
+#include "../integration/sapi-util.h"
+#define LOGMODULE testtpmclient
+#include "util/log.h"
 
 #define SESSIONS_ARRAY_COUNT MAX_NUM_SESSIONS+1
 
@@ -47,7 +53,7 @@ TSS2_RC AddSession( SESSION_LIST_ENTRY **sessionEntry )
 {
     SESSION_LIST_ENTRY **lastEntry, *newEntry;
 
-//    DebugPrintf( 0, "In AddSession\n" );
+//    LOG_INFO("In AddSession" );
 
     // find end of list.
     for( lastEntry = &sessionsList; *lastEntry != 0; lastEntry = &( (SESSION_LIST_ENTRY *)*lastEntry)->nextEntry )
@@ -74,7 +80,7 @@ void DeleteSession( SESSION *session )
     SESSION_LIST_ENTRY *predSession;
     SESSION_LIST_ENTRY *newNextEntry;
 
-//    DebugPrintf( 0, "In DeleteSession\n" );
+//    LOG_INFO("In DeleteSession" );
 
     if( session == &sessionsList->session )
         sessionsList = 0;
@@ -105,7 +111,7 @@ TSS2_RC GetSessionStruct( TPMI_SH_AUTH_SESSION sessionHandle, SESSION **session 
     TSS2_RC rval = TSS2_APP_RC_GET_SESSION_STRUCT_FAILED;
     SESSION_LIST_ENTRY *sessionEntry;
 
-    DebugPrintf( 0, "In GetSessionStruct\n" );
+    LOG_INFO("In GetSessionStruct" );
 
     if( session != 0 )
     {
@@ -131,7 +137,7 @@ TSS2_RC GetSessionAlgId( TPMI_SH_AUTH_SESSION sessionHandle, TPMI_ALG_HASH *sess
     TSS2_RC rval = TSS2_APP_RC_GET_SESSION_ALG_ID_FAILED;
     SESSION *session;
 
-    DebugPrintf( 0, "In GetSessionAlgId\n" );
+    LOG_INFO("In GetSessionAlgId" );
 
     rval = GetSessionStruct( sessionHandle, &session );
 
@@ -167,8 +173,8 @@ TSS2_RC StartAuthSession( SESSION *session, TSS2_TCTI_CONTEXT *tctiContext )
 
     key.size = 0;
 
-    tmpSysContext = InitSysContext( 1000, tctiContext, &abiVersion );
-    if( tmpSysContext == 0 )
+    tmpSysContext = sapi_init_from_tcti_ctx(tctiContext);
+    if (tmpSysContext == NULL)
         return TSS2_APP_RC_INIT_SYS_CONTEXT_FAILED;
 
     if( session->nonceOlder.size == 0 )
@@ -199,17 +205,15 @@ TSS2_RC StartAuthSession( SESSION *session, TSS2_TCTI_CONTEXT *tctiContext )
         {
             // Generate the key used as input to the KDF.
             rval = ConcatSizedByteBuffer((TPM2B_MAX_BUFFER *)&key, (TPM2B *)&session->authValueBind);
-            if( rval != TPM2_RC_SUCCESS )
-            {
-                TeardownSysContext( &tmpSysContext );
-                return(  rval );
+            if (rval != TPM2_RC_SUCCESS) {
+                sapi_teardown(tmpSysContext);
+                return rval;
             }
 
             rval = ConcatSizedByteBuffer((TPM2B_MAX_BUFFER *)&key, (TPM2B *)&session->salt);
-            if( rval != TPM2_RC_SUCCESS )
-            {
-                TeardownSysContext( &tmpSysContext );
-                return( rval );
+            if (rval != TPM2_RC_SUCCESS) {
+                sapi_teardown(tmpSysContext);
+                return rval;
             }
 
             bytes = GetDigestSize( session->authHash );
@@ -224,10 +228,9 @@ TSS2_RC StartAuthSession( SESSION *session, TSS2_TCTI_CONTEXT *tctiContext )
                             (TPM2B *)&session->nonceOlder, bytes * 8, (TPM2B_MAX_BUFFER *)&session->sessionKey);
             }
 
-            if( rval != TPM2_RC_SUCCESS )
-            {
-                TeardownSysContext( &tmpSysContext );
-                return( TSS2_APP_RC_CREATE_SESSION_KEY_FAILED );
+            if (rval != TPM2_RC_SUCCESS) {
+                sapi_teardown(tmpSysContext);
+                return TSS2_APP_RC_CREATE_SESSION_KEY_FAILED;
             }
         }
 
@@ -236,8 +239,7 @@ TSS2_RC StartAuthSession( SESSION *session, TSS2_TCTI_CONTEXT *tctiContext )
         session->nvNameChanged = 0;
     }
 
-    TeardownSysContext( &tmpSysContext );
-
+    sapi_teardown(tmpSysContext);
     return rval;
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #;**********************************************************************;
-# Copyright (c) 2017, Intel Corporation
+# Copyright (c) 2017 - 2018, Intel Corporation
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -53,6 +53,23 @@ while test $# -gt 0; do
     esac
     shift
 done
+
+# Verify the running shell and OS environment is sufficient to run these tests.
+sanity_test ()
+{
+    # Check special file
+    if [ ! -e /dev/urandom ]; then
+        echo  "Missing file /dev/urandom; exiting"
+        exit 1
+    fi
+
+    # Check ps
+    PS_LINES=$(ps -e 2>/dev/null | wc -l)
+    if [ "$PS_LINES" -eq 0 ] ; then
+        echo "Command ps not listing processes; exiting"
+        exit 1
+    fi
+}
 
 # This function takes a PID as a parameter and determines whether or not the
 # process is currently running. If the daemon is running 0 is returned. Any
@@ -147,6 +164,8 @@ daemon_stop ()
     return ${ret}
 }
 
+sanity_test
+
 # Once option processing is done, $@ should be the name of the test executable
 # followed by all of the options passed to the test executable.
 TEST_BIN=$(realpath "$1")
@@ -157,22 +176,89 @@ TEST_NAME=$(basename "${TEST_BIN}")
 SIM_LOG_FILE=${TEST_BIN}_simulator.log
 SIM_PID_FILE=${TEST_BIN}_simulator.pid
 SIM_TMP_DIR=$(mktemp --directory --tmpdir=/tmp tpm_server_XXXXXX)
-for i in $(seq 5); do
-    SIM_PORT=$(od -A n -N 2 -t u2 /dev/urandom | awk -v min=1024 -v max=65535 '{print ($1 % (max - min)) + min}')
-    simulator_start ${SIM_BIN} ${SIM_PORT} ${SIM_LOG_FILE} ${SIM_PID_FILE} ${SIM_TMP_DIR}
-    if [ $? -eq 0 ]; then
-        break;
-    else
-        echo "Failed to start simulator on port ${SIM_PORT}, retrying"
+PORT_MIN=1024
+PORT_MAX=65534
+BACKOFF_FACTOR=2
+BACKOFF_MAX=6
+BACKOFF=1
+for i in $(seq ${BACKOFF_MAX}); do
+    SIM_PORT_DATA=$(od -A n -N 2 -t u2 /dev/urandom | awk -v min=${PORT_MIN} -v max=${PORT_MAX} '{print ($1 % (max - min)) + min}')
+    if [ $(expr ${SIM_PORT_DATA} % 2) -eq 1 ]; then
+        SIM_PORT_DATA=$((${SIM_PORT_DATA}-1))
+    fi
+    SIM_PORT_CMD=$((${SIM_PORT_DATA}+1))
+    echo "Starting simulator on port ${SIM_PORT_DATA}"
+    simulator_start ${SIM_BIN} ${SIM_PORT_DATA} ${SIM_LOG_FILE} ${SIM_PID_FILE} ${SIM_TMP_DIR}
+    sleep 1 # give daemon time to bind to ports
+    if [ ! -s ${SIM_PID_FILE} ] ; then
+        echo "Simulator PID file is empty or missing. Giving up."
+        exit 1
+    fi
+    PID=$(cat ${SIM_PID_FILE})
+    echo "simulator PID: ${PID}";
+    netstat -ltpn 2> /dev/null | grep "${PID}" | grep -q "${SIM_PORT_DATA}"
+    ret_data=$?
+    netstat -ltpn 2> /dev/null | grep "${PID}" | grep -q "${SIM_PORT_CMD}"
+    ret_cmd=$?
+    if [ \( $ret_data -eq 0 \) -a \( $ret_cmd -eq 0 \) ]; then
+        echo "Simulator with PID ${PID} bound to port ${SIM_PORT_DATA} and " \
+             "${SIM_PORT_CMD} successfully.";
+        break
+    fi
+    echo "Port conflict? Cleaning up PID: ${PID}"
+    kill "${PID}"
+    BACKOFF=$((${BACKOFF}*${BACKOFF_FACTOR}))
+    echo "Failed to start simulator: port ${SIM_PORT_DATA} or " \
+         "${SIM_PORT_CMD} probably in use. Retrying in ${BACKOFF}."
+    sleep ${BACKOFF}
+    if [ $i -eq 10 ]; then
+        echo "Failed to start simulator after $i tries. Giving up.";
+        exit 1
     fi
 done
 
-# execute the test script
+while true; do
+
 env TPM20TEST_TCTI_NAME="socket" \
     TPM20TEST_SOCKET_ADDRESS="127.0.0.1" \
-    TPM20TEST_SOCKET_PORT="${SIM_PORT}" \
+    TPM20TEST_SOCKET_PORT="${SIM_PORT_DATA}" \
+    G_MESSAGES_DEBUG=all ./test/helper/tpm_startup
+if [ $? -ne 0 ]; then
+    echo "TPM_StartUp failed"
+    ret=99
+    break
+fi
+
+env TPM20TEST_TCTI_NAME="socket" \
+    TPM20TEST_SOCKET_ADDRESS="127.0.0.1" \
+    TPM20TEST_SOCKET_PORT="${SIM_PORT_DATA}" \
+    G_MESSAGES_DEBUG=all ./test/helper/tpm_transientempty
+if [ $? -ne 0 ]; then
+    echo "TPM transient area not empty => skipping"
+    ret=77
+    break
+fi
+
+echo "Execute the test script"
+env TPM20TEST_TCTI_NAME="socket" \
+    TPM20TEST_SOCKET_ADDRESS="127.0.0.1" \
+    TPM20TEST_SOCKET_PORT="${SIM_PORT_DATA}" \
     G_MESSAGES_DEBUG=all $@
 ret=$?
+echo "Script returned $ret"
+
+env TPM20TEST_TCTI_NAME="socket" \
+    TPM20TEST_SOCKET_ADDRESS="127.0.0.1" \
+    TPM20TEST_SOCKET_PORT="${SIM_PORT_DATA}" \
+    G_MESSAGES_DEBUG=all ./test/helper/tpm_transientempty
+if [ $? -ne 0 ]; then
+    echo "TPM transient area not empty or generally failed after test"
+    ret=99
+    break
+fi
+
+break
+done
 
 # This sleep is sadly necessary: If we kill the tabrmd w/o sleeping for a
 # second after the test finishes the simulator will die too. Bug in the

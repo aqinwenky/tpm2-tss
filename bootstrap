@@ -17,18 +17,21 @@ AUTORECONF=${AUTORECONF:-autoreconf}
 
 echo "Generating file lists: ${VARS_FILE}"
 (
-  src_listvar "sysapi/sysapi" "*.c" "SYSAPI_C"
-  src_listvar "sysapi/include" "*.h" "SYSAPI_H"
-  src_listvar "sysapi/sysapi_util" "*.c" "SYSAPIUTIL_C"
-  printf "SYSAPI_SRC = \$(SYSAPI_H) \$(SYSAPI_C) \$(SYSAPIUTIL_C)\n"
+  src_listvar "src/util" "*.c" "UTIL_C"
+  src_listvar "src/util" "*.h" "UTIL_H"
+  printf "UTIL_SRC = \$(UTIL_C) \$(UTIL_H)\n"
 
-  src_listvar "common" "*.c" "COMMON_C"
-  src_listvar "common" "*.h" "COMMON_H"
-  printf "COMMON_SRC = \$(COMMON_C) \$(COMMON_H)\n"
+  src_listvar "src/tss2-sys/" "*.c" "TSS2_SYS_C"
+  src_listvar "src/tss2-sys/" "*.h" "TSS2_SYS_H"
+  printf "TSS2_SYS_SRC = \$(TSS2_SYS_H) \$(TSS2_SYS_C)\n"
 
-  src_listvar "marshal" "*.c" "MARSHAL_C"
-  src_listvar "marshal" "*.h" "MARSHAL_H"
-  printf "MARSHAL_SRC = \$(MARSHAL_C) \$(MARSHAL_H)"
+  src_listvar "src/tss2-esys/" "*.h" "TSS2_ESYS_H"
+  src_listvar "src/tss2-esys/" "*.c" "TSS2_ESYS_C"
+  printf "TSS2_ESYS_SRC = \$(TSS2_ESYS_H) \$(TSS2_ESYS_C)\n"
+
+  src_listvar "src/tss2-mu" "*.c" "TSS2_MU_C"
+  src_listvar "src/tss2-mu" "*.h" "TSS2_MU_H"
+  printf "TSS2_MU_SRC = \$(TSS2_MU_C) \$(TSS2_MU_H)"
 ) > ${VARS_FILE}
 
 ${AUTORECONF} --install --sym

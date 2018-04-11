@@ -25,9 +25,14 @@
 // THE POSSIBILITY OF SUCH DAMAGE.
 //**********************************************************************;
 
-#include "sapi/tpm20.h"
-#include "sample.h"
+#include "tss2_tpm2_types.h"
+
+#include "tpmclient.int.h"
 #include "sysapi_util.h"
+#include "../integration/sapi-util.h"
+
+#define MAX_NUM_ENTITIES 100
+static ENTITY entities[MAX_NUM_ENTITIES + 1];
 
 void InitEntities()
 {

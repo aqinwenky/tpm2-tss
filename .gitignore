@@ -1,4 +1,7 @@
 *.a
+*.gcda
+*.gcno
+*.gcov
 *.la
 *.lo
 *.log
@@ -15,6 +18,7 @@
 .deps/
 .dirstamp
 .libs
+.vs/
 *~
 .*.swp
 .*.swo
@@ -61,4 +65,15 @@ test-suite.log
 test/ibmtpm*
 # ignore all files in test/unit without a file extension
 test/unit/*
-test/unit/!*.*
+!test/unit/*.[ch]
+doc/Doxyfile
+doc/doxy/
+doc/html/
+doc/man/
+tpm2-tss-2.0.0-dev.tar.gz
+tpm2-tss-2.0.0-dev/
+
+test/helper/tpm_startup
+test/helper/tpm_transientempty
+Doxyfile
+doc/rtf

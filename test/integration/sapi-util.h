@@ -26,14 +26,10 @@
 #ifndef TEST_INTEGRATION_SAPI_UTIL_H
 #define TEST_INTEGRATION_SAPI_UTIL_H
 
-#include "sapi/tpm20.h"
-/*
- * Definition of TSS2_RC values returned by application level stuff. We use
- * this "level" for errors returned by functions in the integration test
- * harness.
- */
-#define TSS2_APP_ERROR(base_rc)   (TSS2_APP_ERROR_LEVEL | base_rc)
-#define TSS2_APP_RC_BAD_REFERENCE  TSS2_APP_ERROR (TSS2_BASE_RC_BAD_REFERENCE)
+#include "tss2_tpm2_types.h"
+#include "tss2_sys.h"
+#include "util/tpm2b.h"
+
 /*
  * This macro is like the GNU TEMP_FAILURE_RETRY macro for the
  * TPM2_RC_RETRY response code.
@@ -84,6 +80,16 @@ create_aes_128_cfb (
     TSS2_SYS_CONTEXT *sapi_context,
     TPM2_HANDLE        handle_parent,
     TPM2_HANDLE       *handle);
+
+/*
+ * This function creates a RSA key of KEYEDHASH type.
+ */
+TSS2_RC
+create_keyedhash_key (
+    TSS2_SYS_CONTEXT *sapi_context,
+    TPM2_HANDLE       handle_parent,
+    TPM2_HANDLE      *handle);
+
 /*
  * This function will decrypt or encrypt the 'data_in' buffer and return the
  * results in the 'data_out' parameter. Decrypt or encrypt is selected using
@@ -147,5 +153,56 @@ decrypt_2_cfb (
     TPMI_DH_OBJECT    handle,
     TPM2B_MAX_BUFFER *data_in,
     TPM2B_MAX_BUFFER *data_out);
+
+/*
+ * This is a helper function for digest calculation.
+ * alg can be TPM2_ALG_SHA1, TPM2_ALG_SHA256, TPM2_ALG_SHA384,
+ * and TPM2_ALG_SHA512
+ */
+TSS2_RC
+hash (
+    TPM2_ALG_ID alg,
+    const void *data,
+    int size,
+    TPM2B_DIGEST *out);
+
+/*
+ * This is a helper function for calculating HMAC.
+ * alg can be TPM2_ALG_SHA1, TPM2_ALG_SHA256, TPM2_ALG_SHA384,
+ * and TPM2_ALG_SHA512
+ */
+TSS2_RC
+hmac(
+    TPM2_ALG_ID alg,
+    const void *key,
+    int key_len,
+    TPM2B_DIGEST **buffer_list,
+    TPM2B_DIGEST *out);
+
+/*
+ * Returns digest size for a give hash alg
+ */
+UINT16
+GetDigestSize(TPM2_ALG_ID hash);
+
+TSS2_RC
+CompareSizedByteBuffer(
+        TPM2B *buffer1,
+        TPM2B *buffer2);
+
+TSS2_RC
+ConcatSizedByteBuffer(
+        TPM2B_MAX_BUFFER *result,
+        TPM2B *buf);
+
+void
+CatSizedByteBuffer(
+        TPM2B *dest,
+        TPM2B *src);
+
+UINT16
+CopySizedByteBuffer(
+        TPM2B *dest,
+        TPM2B *src);
 
 #endif /* TEST_INTEGRATION_SAPI_UTIL_H */

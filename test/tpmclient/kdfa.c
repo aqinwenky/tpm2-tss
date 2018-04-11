@@ -25,19 +25,28 @@
 // THE POSSIBILITY OF SUCH DAMAGE.
 //**********************************************************************;
 
-#include "sapi/tpm20.h"
-#include "sample.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include "sysapi_util.h"
-#include "tss2_endian.h"
 
-//
-//
-TSS2_RC KDFa( TPMI_ALG_HASH hashAlg, TPM2B *key, char *label,
-    TPM2B *contextU, TPM2B *contextV, UINT16 bits, TPM2B_MAX_BUFFER  *resultKey )
+#include "tss2_tpm2_types.h"
+#include "../integration/sapi-util.h"
+
+#include "tpmclient.int.h"
+#include "sysapi_util.h"
+#include "util/tss2_endian.h"
+#define LOGMODULE test
+#include "util/log.h"
+
+TSS2_RC KDFa(
+    TPMI_ALG_HASH hashAlg,
+    TPM2B *key,
+    char *label,
+    TPM2B *contextU,
+    TPM2B *contextV,
+    UINT16 bits,
+    TPM2B_MAX_BUFFER *resultKey)
 {
-    TPM2B_DIGEST tmpResult;
+    TPM2B_DIGEST digest;
     TPM2B_DIGEST tpm2bLabel, tpm2bBits, tpm2b_i_2;
     UINT8 *tpm2bBitsPtr = &tpm2bBits.buffer[0];
     UINT8 *tpm2b_i_2Ptr = &tpm2b_i_2.buffer[0];
@@ -47,11 +56,8 @@ TSS2_RC KDFa( TPMI_ALG_HASH hashAlg, TPM2B *key, char *label,
     int i, j;
     UINT16 bytes = bits / 8;
 
-#ifdef DEBUG
-    DebugPrintf( 0, "KDFA, hashAlg = %4.4x\n", hashAlg );
-    DebugPrintf( 0, "\n\nKDFA, key = \n" );
-    PrintSizedBuffer( key );
-#endif
+    LOG_DEBUG("KDFA, hashAlg = %4.4x", hashAlg);
+    LOGBLOB_DEBUG(&key->buffer[0], key->size, "KDFA, key =");
 
     resultKey->size = 0;
 
@@ -69,16 +75,9 @@ TSS2_RC KDFa( TPMI_ALG_HASH hashAlg, TPM2B *key, char *label,
         tpm2bLabel.buffer[i] = label[i];
     }
 
-#ifdef DEBUG
-    DebugPrintf( 0, "\n\nKDFA, tpm2bLabel = \n" );
-    PrintSizedBuffer((TPM2B *)&tpm2bLabel);
-
-    DebugPrintf( 0, "\n\nKDFA, contextU = \n" );
-    PrintSizedBuffer( contextU );
-
-    DebugPrintf( 0, "\n\nKDFA, contextV = \n" );
-    PrintSizedBuffer( contextV );
-#endif
+    LOGBLOB_DEBUG(&tpm2bLabel.buffer[0], tpm2bLabel.size, "KDFA, tpm2bLabel =");
+    LOGBLOB_DEBUG(&contextU->buffer[0], contextU->size, "KDFA, contextU =");
+    LOGBLOB_DEBUG(&contextV->buffer[0], contextV->size, "KDFA, contextV =");
 
     resultKey->size = 0;
 
@@ -86,8 +85,6 @@ TSS2_RC KDFa( TPMI_ALG_HASH hashAlg, TPM2B *key, char *label,
 
     while(resultKey->size < bytes)
     {
-        // Inner loop
-
         i_Swizzled = BE_TO_HOST_32(i++);
         *(UINT32 *)tpm2b_i_2Ptr = i_Swizzled;
 
@@ -98,29 +95,23 @@ TSS2_RC KDFa( TPMI_ALG_HASH hashAlg, TPM2B *key, char *label,
         bufferList[j++] = (TPM2B_DIGEST *)contextV;
         bufferList[j++] = (TPM2B_DIGEST *)&(tpm2bBits);
         bufferList[j++] = (TPM2B_DIGEST *)0;
-#ifdef DEBUG
-        for( j = 0; bufferList[j] != 0; j++ )
-        {
-            DebugPrintf( 0, "\n\nbufferlist[%d]:\n", j );
-            PrintSizedBuffer( &( bufferList[j]->b ) );
-        }
+#if LOGLEVEL == LOGLEVEL_DEBUG || \
+    LOGLEVEL == LOGLEVEL_TRACE
+        for (j = 0; bufferList[j] != 0; j++)
+            LOGBLOB_DEBUG(&bufferList[j]->buffer[0], bufferList[j]->size, "bufferlist[%d]:", j);
+
 #endif
-        rval = TpmHmac(hashAlg, key, (TPM2B **)&( bufferList[0] ), &tmpResult);
-        if( rval != TPM2_RC_SUCCESS )
-        {
-            return( rval );
+        rval = hmac(hashAlg, key->buffer, key->size, bufferList, &digest);
+        if (rval != TPM2_RC_SUCCESS) {
+            LOGBLOB_ERROR(digest.buffer, digest.size, "HMAC Failed rval = %d !!!", rval);
+            return rval;
         }
 
-        ConcatSizedByteBuffer(resultKey, (TPM2B *)&tmpResult);
+        ConcatSizedByteBuffer(resultKey, (TPM2B *)&digest);
     }
 
     // Truncate the result to the desired size.
     resultKey->size = bytes;
-
-#ifdef DEBUG
-    DebugPrintf( 0, "\n\nKDFA, resultKey = \n" );
-    PrintSizedBuffer( &( resultKey->b ) );
-#endif
-
+    LOGBLOB_DEBUG(&resultKey->buffer[0], resultKey->size, "KDFA, resultKey = ");
     return TPM2_RC_SUCCESS;
 }

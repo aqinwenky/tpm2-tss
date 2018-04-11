@@ -1,10 +1,17 @@
 #include <stdio.h>
-#include "log.h"
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+
+#include "tss2_tcti.h"
+#include "tss2_sys.h"
+
+#define LOGMODULE test
+#include "util/log.h"
 #include "test.h"
-#include "sapi/tpm20.h"
 #include "sapi-util.h"
 /**
- * This program contains integration test for asymetric encrypt and
+ * This program contains integration test for asymmetric encrypt and
  * decrypt use case that has SAPIs Tss2_Sys_CreatePrimary,
  * Tss2_Sys_Create, Tss2_Sys_Load, Tss2_Sys_RSA_Encrypt and
  * Tss2_Sys_RSA_Decrypt. First, the program creates the object and load
@@ -73,11 +80,13 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     out_public.size = 0;
     creation_data.size = 0;
 
-    print_log("Asymmetric Encryption and Decryption Tests started.");
+    LOG_INFO("Asymmetric Encryption and Decryption Tests started.");
     rc = Tss2_Sys_CreatePrimary(sapi_context, TPM2_RH_OWNER, &sessions_data, &in_sensitive, &in_public, &outside_info, &creation_pcr, &sym_handle, &out_public, &creation_data, &creation_hash, &creation_ticket, &name, &sessions_data_out);
-    if (rc != TPM2_RC_SUCCESS)
-        print_fail("CreatePrimary FAILED! Response Code : 0x%x", rc);
-    print_log("New key successfully created.  Handle: 0x%8.8x\n", sym_handle);
+    if (rc != TPM2_RC_SUCCESS) {
+        LOG_ERROR("CreatePrimary FAILED! Response Code : 0x%x", rc);
+        exit(1);
+    }
+    LOG_INFO("New key successfully created.  Handle: 0x%8.8x", sym_handle);
 
     in_public.publicArea.type = TPM2_ALG_RSA;
     in_public.publicArea.parameters.rsaDetail.symmetric.algorithm = TPM2_ALG_NULL;
@@ -91,7 +100,7 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     in_public.publicArea.objectAttributes &= ~TPMA_OBJECT_RESTRICTED;
     in_public.publicArea.objectAttributes |= TPMA_OBJECT_USERWITHAUTH;
     in_public.publicArea.objectAttributes |= TPMA_OBJECT_DECRYPT;
-    in_public.publicArea.objectAttributes |= TPMA_OBJECT_SIGN;
+    in_public.publicArea.objectAttributes |= TPMA_OBJECT_SIGN_ENCRYPT;
     in_public.publicArea.objectAttributes |= TPMA_OBJECT_FIXEDTPM;
     in_public.publicArea.objectAttributes |= TPMA_OBJECT_FIXEDPARENT;
     in_public.publicArea.objectAttributes |= TPMA_OBJECT_SENSITIVEDATAORIGIN;
@@ -102,29 +111,47 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     sessions_data.auths[0].hmac.size = 0;
 
     rc = TSS2_RETRY_EXP (Tss2_Sys_Create(sapi_context, sym_handle, &sessions_data, &in_sensitive, &in_public, &outside_info, &creation_pcr, &out_private, &out_public, &creation_data, &creation_hash, &creation_ticket, &sessions_data_out));
-    if (rc != TPM2_RC_SUCCESS)
-        print_fail("Create FAILED! Response Code : 0x%x", rc);
-
+    if (rc != TPM2_RC_SUCCESS) {
+        LOG_ERROR("Create FAILED! Response Code : 0x%x", rc);
+        exit(1);
+    }
     rc = Tss2_Sys_Load(sapi_context, sym_handle, &sessions_data, &out_private, &out_public, &loaded_sym_handle, &name, &sessions_data_out);
-    if (rc != TPM2_RC_SUCCESS)
-        print_fail("Load FAILED! Response Code : 0x%x", rc);
-    print_log( "Loaded key handle:  %8.8x\n", loaded_sym_handle );
+    if (rc != TPM2_RC_SUCCESS) {
+        LOG_ERROR("Load FAILED! Response Code : 0x%x", rc);
+        exit(1);
+    }
+    LOG_INFO( "Loaded key handle:  %8.8x", loaded_sym_handle );
 
     input_message.size = strlen(message);
     memcpy(input_message.buffer, message, input_message.size);
     in_scheme.scheme = TPM2_ALG_RSAES;
     outside_info.size = 0;
     rc = Tss2_Sys_RSA_Encrypt(sapi_context, loaded_sym_handle, 0, &input_message, &in_scheme, &outside_info, &output_data, 0);
-    if(rc != TPM2_RC_SUCCESS)
-        print_fail("RSA_Encrypt FAILED! Response Code : 0x%x", rc);
-    print_log("Encrypt successed.");
+    if(rc != TPM2_RC_SUCCESS) {
+        LOG_ERROR("RSA_Encrypt FAILED! Response Code : 0x%x", rc);
+        exit(1);
+    }
+    LOG_INFO("Encrypt successful.");
 
     rc = Tss2_Sys_RSA_Decrypt(sapi_context, loaded_sym_handle, &sessions_data, &output_data, &in_scheme, &outside_info, &output_message, &sessions_data_out);
-    if(rc != TPM2_RC_SUCCESS)
-        print_fail("RSA_Decrypt FAILED! Response Code : 0x%x", rc);
-    print_log("Decrypt successed.");
+    if(rc != TPM2_RC_SUCCESS) {
+        LOG_ERROR("RSA_Decrypt FAILED! Response Code : 0x%x", rc);
+        exit(1);
+    }
+    LOG_INFO("Decrypt successful.");
 
-    print_log("Asymmetric Encryption and Decryption Test Passed!");
+    LOG_INFO("Asymmetric Encryption and Decryption Test Passed!");
+
+    rc = Tss2_Sys_FlushContext(sapi_context, sym_handle);
+    if (rc != TSS2_RC_SUCCESS) {
+        LOG_ERROR("Tss2_Sys_FlushContext failed with 0x%"PRIx32, rc);
+        return 99; /* fatal error */
+    }
+    rc = Tss2_Sys_FlushContext(sapi_context, loaded_sym_handle);
+    if (rc != TSS2_RC_SUCCESS) {
+        LOG_ERROR("Tss2_Sys_FlushContext failed with 0x%"PRIx32, rc);
+        return 99; /* fatal error */
+    }
     return 0;
 }
 

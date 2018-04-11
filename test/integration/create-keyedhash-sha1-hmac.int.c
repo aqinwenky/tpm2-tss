@@ -1,5 +1,10 @@
+#include <stdlib.h>
+
+#include "tss2_tpm2_types.h"
+
 #include "inttypes.h"
-#include "log.h"
+#define LOGMODULE test
+#include "util/log.h"
 #include "sapi-util.h"
 #include "test.h"
 
@@ -33,19 +38,20 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
 
     rc = create_primary_rsa_2048_aes_128_cfb (sapi_context, &parent_handle);
     if (rc == TSS2_RC_SUCCESS) {
-        print_log ("primary created successfully: 0x%" PRIx32, parent_handle);
+        LOG_INFO("primary created successfully: 0x%" PRIx32, parent_handle);
     } else {
-       return rc;
+        LOG_ERROR("CreatePrimary failed with 0x%" PRIx32, rc);
+        return 99; /* fatal error */
     }
 
     inPublic.publicArea.nameAlg = TPM2_ALG_SHA1;
     inPublic.publicArea.type = TPM2_ALG_KEYEDHASH;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_SIGN;
+    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_SIGN_ENCRYPT;
     inPublic.publicArea.objectAttributes |= TPMA_OBJECT_SENSITIVEDATAORIGIN;
     inPublic.publicArea.parameters.keyedHashDetail.scheme.scheme = TPM2_ALG_HMAC;
     inPublic.publicArea.parameters.keyedHashDetail.scheme.details.hmac.hashAlg = TPM2_ALG_SHA1;
 
-    print_log ("Create keyedhash SHA1 HMAC");
+    LOG_INFO("Create keyedhash SHA1 HMAC");
     rc = TSS2_RETRY_EXP (Tss2_Sys_Create (sapi_context,
                                           parent_handle,
                                           &sessions_cmd,
@@ -60,10 +66,17 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
                                           &creationTicket,
                                           &sessions_rsp));
     if (rc == TPM2_RC_SUCCESS) {
-        print_log ("success");
+        LOG_INFO("success");
     } else {
-        print_fail ("Create FAILED! Response Code : 0x%x", rc);
+        LOG_ERROR("Create FAILED! Response Code : 0x%x", rc);
+        return 1;
     }
 
-    return rc;
+    rc = Tss2_Sys_FlushContext(sapi_context, parent_handle);
+    if (rc != TSS2_RC_SUCCESS) {
+        LOG_ERROR("Tss2_Sys_FlushContext failed with 0x%"PRIx32, rc);
+        return 99; /* fatal error */
+    }
+
+    return 0;
 }

@@ -31,17 +31,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "sapi/tpm20.h"
+#include "tss2_sys.h"
+#include "tss2_tcti_device.h"
+#include "tss2_tcti_mssim.h"
+
+#include "../integration/context-util.h"
 #include "../integration/sapi-util.h"
-#include "sample.h"
-#include "tpmclient.h"
-#include "tcti_util.h"
-#include "tss2_endian.h"
+#include "../integration/session-util.h"
+#include "tpmclient.int.h"
+#include "util/tss2_endian.h"
 #include "sysapi_util.h"
-#include "tcti/tcti_device.h"
-#include "tcti/tcti_socket.h"
-#include "syscontext.h"
-#include "common/debug.h"
+#define LOGMODULE testtpmclient
+#include "util/log.h"
 
 //
 // TPM indices and sizes
@@ -58,6 +59,11 @@
 #define TPM20_INDEX_PASSWORD_TEST       0x01500020
 
 #define SESSIONS_COUNT 1
+
+#define TSSWG_INTEROP 1
+#define TSS_SAPI_FIRST_FAMILY 2
+#define TSS_SAPI_FIRST_LEVEL 1
+#define TSS_SAPI_FIRST_VERSION 108
 
 #define SET_PCR_SELECT_BIT( pcrSelection, pcr ) \
                                                 (pcrSelection).pcrSelect[( (pcr)/8 )] |= ( 1 << ( (pcr) % 8) );
@@ -78,97 +84,52 @@ char errorString[errorStringSize];
 
 UINT8 simulator = 1;
 
-UINT32 tpmMaxResponseLen = TPMBUF_LEN;
-
 UINT8 resMgrInitialized = 0;
 
 UINT8 pcrAfterExtend[20];
 TPM2_HANDLE loadedRsaKeyHandle;
 TPM2_HANDLE loadedSha1KeyHandle;
-
 TPM2B_AUTH loadedSha1KeyAuth;
-
-TPM2_HANDLE handle1024, handle2048sha1, handle2048rsa;
 
 UINT8 indent = 0;
 
 TSS2_SYS_CONTEXT *sysContext;
 
-TCTI_SOCKET_CONF rmInterfaceConfig = {
-    DEFAULT_HOSTNAME,
-    DEFAULT_SIMULATOR_TPM_PORT,
-    DebugPrintfCallback,
-    DebugPrintBufferCallback,
-    NULL
-};
-
 TSS2_TCTI_CONTEXT *resMgrTctiContext = 0;
-TSS2_ABI_VERSION abiVersion = { TSSWG_INTEROP, TSS_SAPI_FIRST_FAMILY, TSS_SAPI_FIRST_LEVEL, TSS_SAPI_FIRST_VERSION };
 
 #define MSFT_MANUFACTURER_ID 0x4d534654
 #define IBM_MANUFACTURER_ID 0x49424d20
-
-TPMI_SH_AUTH_SESSION StartPolicySession();
-TPMI_SH_AUTH_SESSION InitNvAuxPolicySession();
-
-TSS2_RC CompareTPM2B(TPM2B *buffer1, TPM2B *buffer2)
-{
-    if (buffer1->size != buffer2->size)
-        return TPM2_RC_FAILURE;
-
-    if (memcmp(buffer1->buffer, buffer2->buffer, buffer1->size))
-            return TPM2_RC_FAILURE;
-
-    return TPM2_RC_SUCCESS;
-}
-
-void PrintSizedBuffer( TPM2B *sizedBuffer )
-{
-    int i;
-
-    for( i = 0; i < sizedBuffer->size; i++ )
-    {
-        DebugPrintf( NO_PREFIX, "%2.2x ", sizedBuffer->buffer[i] );
-
-        if( ( (i+1) % 16 ) == 0 )
-        {
-            DebugPrintf( NO_PREFIX, "\n" );
-        }
-    }
-    DebugPrintf( NO_PREFIX, "\n" );
-}
-
 #define LEVEL_STRING_SIZE 50
 
-void ErrorHandler( UINT32 rval )
+static void ErrorHandler( UINT32 rval )
 {
-    UINT32 errorLevel = rval & TSS2_ERROR_LEVEL_MASK;
+    UINT32 errorLevel = rval & TSS2_RC_LAYER_MASK;
     char levelString[LEVEL_STRING_SIZE + 1];
 
     switch( errorLevel )
     {
-        case TSS2_TPM_ERROR_LEVEL:
+        case TSS2_TPM_RC_LAYER:
             strncpy( levelString, "TPM", LEVEL_STRING_SIZE );
             break;
-        case TSS2_APP_ERROR_LEVEL:
+        case TSS2_APP_RC_LAYER:
             strncpy( levelString, "Application", LEVEL_STRING_SIZE );
             break;
-        case TSS2_SYS_ERROR_LEVEL:
+        case TSS2_SYS_RC_LAYER:
             strncpy( levelString, "System API", LEVEL_STRING_SIZE );
             break;
-        case TSS2_SYS_PART2_ERROR_LEVEL:
+        case TSS2_MU_RC_LAYER:
             strncpy( levelString, "System API TPM encoded", LEVEL_STRING_SIZE );
             break;
-        case TSS2_TCTI_ERROR_LEVEL:
+        case TSS2_TCTI_RC_LAYER:
             strncpy( levelString, "TCTI", LEVEL_STRING_SIZE );
             break;
-        case TSS2_RESMGRTPM_ERROR_LEVEL:
+        case TSS2_RESMGR_TPM_RC_LAYER:
             strncpy( levelString, "Resource Mgr TPM encoded", LEVEL_STRING_SIZE );
             break;
-        case TSS2_RESMGR_ERROR_LEVEL:
+        case TSS2_RESMGR_RC_LAYER:
             strncpy( levelString, "Resource Mgr", LEVEL_STRING_SIZE );
             break;
-        case TSS2_DRIVER_ERROR_LEVEL:
+        case TSS2_DRIVER_RC_LAYER:
             strncpy( levelString, "Driver", LEVEL_STRING_SIZE );
             break;
         default:
@@ -179,26 +140,24 @@ void ErrorHandler( UINT32 rval )
     snprintf(errorString, errorStringSize, "%s Error: 0x%x\n", levelString, rval);
 }
 
-void Cleanup()
+static void Cleanup()
 {
-    fflush( stdout );
-
-    if( resMgrTctiContext != 0 )
-    {
-        PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
-        TeardownTctiContext( &resMgrTctiContext );
+    if (resMgrTctiContext != NULL) {
+        tcti_platform_command(resMgrTctiContext, MS_SIM_POWER_OFF);
+        tcti_teardown(resMgrTctiContext);
+        resMgrTctiContext = NULL;
     }
 
     exit(1);
 }
 
-void InitSysContextFailure()
+static void InitSysContextFailure()
 {
-    DebugPrintf( NO_PREFIX, "InitSysContext failed, exiting...\n" );
+    LOG_ERROR("InitSysContext failed, exiting...");
     Cleanup();
 }
 
-void Delay( UINT16 delay)
+static void Delay( UINT16 delay)
 {
     volatile UINT32 i, j;
 
@@ -211,14 +170,13 @@ void Delay( UINT16 delay)
 
 #define CheckPassed(rval) {				\
     							\
-    DebugPrintf( NO_PREFIX, "\tpassing case:  " );			\
     if ( rval != TPM2_RC_SUCCESS) {					\
       ErrorHandler( rval);						\
-      DebugPrintf( NO_PREFIX, "\tFAILED!  %s (%s@%u)\n",		\
+      LOG_INFO("passing case: \tFAILED!  %s (%s@%u)",		\
 		   errorString, __FUNCTION__, __LINE__ );		\
       Cleanup();							\
     } else {								\
-      DebugPrintf( NO_PREFIX, "\tPASSED! (%s@%u)\n",			\
+      LOG_INFO("passing case: \tPASSED! (%s@%u)",			\
 		   __FUNCTION__, __LINE__);				\
     }									\
     									\
@@ -231,33 +189,32 @@ TPM2B_NONCE nullSessionNonce, nullSessionNonceOut;
 TPM2B_AUTH nullSessionHmac;
 
 #define CheckFailed(rval, expectedTpmErrorCode) {			\
-    DebugPrintf( NO_PREFIX, "\tfailing case:");				\
     if ( rval != expectedTpmErrorCode) {				\
       ErrorHandler( rval);						\
-      DebugPrintf( NO_PREFIX, "\tFAILED!  Ret code s/b: 0x%x, but was: 0x%x (%s@%u)\n", \
+      LOG_INFO("\tfailing case: FAILED!  Ret code s/b: 0x%x, but was: 0x%x (%s@%u)", \
 		   expectedTpmErrorCode, rval, __FUNCTION__, __LINE__ ); \
       Cleanup();							\
     }	else {								\
-      DebugPrintf( NO_PREFIX, "\tPASSED! (%s@%u)\n",			\
+      LOG_INFO("\tfailing case: PASSED! (%s@%u)",			\
 		   __FUNCTION__, __LINE__);				\
     }									\
     Delay(0);							\
   }
 
 
-TSS2_RC TpmReset()
+static TSS2_RC TpmReset()
 {
     TSS2_RC rval = TSS2_RC_SUCCESS;
 
-    rval = (TSS2_RC)PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
+    rval = (TSS2_RC)tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_OFF );
     if( rval == TSS2_RC_SUCCESS )
     {
-        rval = (TSS2_RC)PlatformCommand( resMgrTctiContext, MS_SIM_POWER_ON );
+        rval = (TSS2_RC)tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_ON );
     }
     return rval;
 }
 
-void TestDictionaryAttackLockReset()
+static void TestDictionaryAttackLockReset()
 {
     UINT32 rval;
     TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
@@ -268,13 +225,13 @@ void TestDictionaryAttackLockReset()
         .nonce={.size=0},
         .hmac={.size=0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nDICTIONARY ATTACK LOCK RESET TEST  :\n" );
+    LOG_INFO("DICTIONARY ATTACK LOCK RESET TEST  :" );
 
     rval = Tss2_Sys_DictionaryAttackLockReset ( sysContext, TPM2_RH_LOCKOUT, &sessionsData, &sessionsDataOut );
     CheckPassed( rval );
 }
 
-TSS2_RC StartPolicySession( TPMI_SH_AUTH_SESSION *sessionHandle )
+static TSS2_RC StartPolicySession( TPMI_SH_AUTH_SESSION *sessionHandle )
 {
     UINT8 i;
     TPM2B_NONCE nonceCaller, nonceTpm;
@@ -298,11 +255,11 @@ TSS2_RC StartPolicySession( TPMI_SH_AUTH_SESSION *sessionHandle )
     return( rval );
 }
 
-void TestTpmStartup()
+static void TestTpmStartup()
 {
     UINT32 rval;
 
-    DebugPrintf( NO_PREFIX, "\nSTARTUP TESTS:\n" );
+    LOG_INFO("STARTUP TESTS:" );
 
     //
     // First test the one-call interface.
@@ -322,9 +279,9 @@ void TestTpmStartup()
 
 
     // Cycle power using simulator interface.
-    rval = PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
+    rval = tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_OFF );
     CheckPassed( rval );
-    rval = PlatformCommand( resMgrTctiContext, MS_SIM_POWER_ON );
+    rval = tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_ON );
     CheckPassed( rval );
 
 
@@ -339,9 +296,9 @@ void TestTpmStartup()
     CheckPassed( rval );
 
     // Cycle power using simulator interface.
-    rval = PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
+    rval = tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_OFF );
     CheckPassed( rval );
-    rval = PlatformCommand( resMgrTctiContext, MS_SIM_POWER_ON );
+    rval = tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_ON );
     CheckPassed( rval );
 
 
@@ -361,7 +318,7 @@ void TestTpmStartup()
     CheckPassed(rval);
 }
 
-void TestTpmGetCapability()
+static void TestTpmGetCapability()
 {
     UINT32 rval;
 
@@ -370,20 +327,20 @@ void TestTpmGetCapability()
     TPMI_YES_NO moreData;
     TPMS_CAPABILITY_DATA capabilityData;
 
-    DebugPrintf( NO_PREFIX, "\nGET_CAPABILITY TESTS:\n" );
+    LOG_INFO("GET_CAPABILITY TESTS:" );
 
     rval = Tss2_Sys_GetCapability( sysContext, 0, TPM2_CAP_TPM_PROPERTIES, TPM2_PT_MANUFACTURER, 1, &moreData, &capabilityData, 0 );
     CheckPassed( rval );
 
     *((UINT32 *)manuIDPtr) = BE_TO_HOST_32(capabilityData.data.tpmProperties.tpmProperty[0].value);
-    DebugPrintf( NO_PREFIX, "\t\tcount: %d, property: %x, manuId: %s\n",
+    LOG_INFO("\t\tcount: %d, property: %x, manuId: %s",
             capabilityData.data.tpmProperties.count,
             capabilityData.data.tpmProperties.tpmProperty[0].property,
             manuID );
 
     rval = Tss2_Sys_GetCapability( sysContext, 0, TPM2_CAP_TPM_PROPERTIES, TPM2_PT_MAX_COMMAND_SIZE, 1, &moreData, &capabilityData, 0 );
     CheckPassed( rval );
-    DebugPrintf( NO_PREFIX, "\t\tcount: %d, property: %x, max cmd size: %d\n",
+    LOG_INFO("\t\tcount: %d, property: %x, max cmd size: %d",
             capabilityData.data.tpmProperties.count,
             capabilityData.data.tpmProperties.tpmProperty[0].property,
             capabilityData.data.tpmProperties.tpmProperty[0].value );
@@ -391,7 +348,7 @@ void TestTpmGetCapability()
 
     rval = Tss2_Sys_GetCapability( sysContext, 0, TPM2_CAP_TPM_PROPERTIES, TPM2_PT_MAX_COMMAND_SIZE, 40, &moreData, &capabilityData, 0 );
     CheckPassed( rval );
-    DebugPrintf( NO_PREFIX, "\t\tcount: %d, property: %x, max cmd size: %d\n",
+    LOG_INFO("\t\tcount: %d, property: %x, max cmd size: %d",
             capabilityData.data.tpmProperties.count,
             capabilityData.data.tpmProperties.tpmProperty[0].property,
             capabilityData.data.tpmProperties.tpmProperty[0].value );
@@ -399,7 +356,7 @@ void TestTpmGetCapability()
 
     rval = Tss2_Sys_GetCapability( sysContext, 0, TPM2_CAP_TPM_PROPERTIES, TPM2_PT_MAX_RESPONSE_SIZE, 1, &moreData, &capabilityData, 0 );
     CheckPassed( rval );
-    DebugPrintf( NO_PREFIX, "\t count: %d, property: %x, max response size: %d\n",
+    LOG_INFO("\t count: %d, property: %x, max response size: %d",
             capabilityData.data.tpmProperties.count,
             capabilityData.data.tpmProperties.tpmProperty[0].property,
             capabilityData.data.tpmProperties.tpmProperty[0].value );
@@ -408,7 +365,7 @@ void TestTpmGetCapability()
     CheckFailed(rval, TPM2_RC_VALUE+TPM2_RC_1+TPM2_RC_P);
 }
 
-void TestTpmClear()
+static void TestTpmClear()
 {
     UINT32 rval;
     TPM2B_AUTH      hmac = { .size = 0 };
@@ -421,7 +378,7 @@ void TestTpmClear()
         .nonce=nonce,
         .hmac=hmac}}};
 
-    DebugPrintf( NO_PREFIX, "\nCLEAR and CLEAR CONTROL TESTS:\n" );
+    LOG_INFO("CLEAR and CLEAR CONTROL TESTS:" );
 
     rval = Tss2_Sys_Clear ( sysContext, TPM2_RH_PLATFORM, &sessionsDataIn, 0 );
     CheckPassed( rval );
@@ -449,7 +406,7 @@ void TestTpmClear()
 
 SESSION *sessions[SESSIONS_COUNT];
 
-void TestStartAuthSession()
+static void TestStartAuthSession()
 {
     UINT32 rval;
     TPM2B_ENCRYPTED_SECRET encryptedSalt;
@@ -482,7 +439,7 @@ void TestStartAuthSession()
 
     encryptedSalt.size = 0;
 
-    DebugPrintf( NO_PREFIX, "\nSTART_AUTH_SESSION TESTS:\n" );
+    LOG_INFO("START_AUTH_SESSION TESTS:" );
 
     symmetric.algorithm = TPM2_ALG_NULL;
     symmetric.keyBits.sym = 0;
@@ -510,7 +467,7 @@ void TestStartAuthSession()
         // Init session struct
         rval = StartAuthSessionWithParams( &sessions[i], TPM2_RH_NULL, 0, TPM2_RH_PLATFORM, 0, &nonceCaller, &encryptedSalt, TPM2_SE_POLICY, &symmetric, TPM2_ALG_SHA256, resMgrTctiContext );
         CheckPassed( rval );
-        DebugPrintf( NO_PREFIX, "Number of sessions created: %d\n\n", i+1 );
+        LOG_INFO("Number of sessions created: %d", i+1 );
 
     }
     // clean up the sessions that I don't want here.
@@ -553,7 +510,7 @@ void TestStartAuthSession()
     }
 }
 
-void TestChangeEps()
+static void TestChangeEps()
 {
     UINT32 rval;
     TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
@@ -563,13 +520,13 @@ void TestChangeEps()
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nCHANGE_EPS TESTS:\n" );
+    LOG_INFO("CHANGE_EPS TESTS:" );
 
     rval = Tss2_Sys_ChangeEPS( sysContext, TPM2_RH_PLATFORM, &sessionsData, &sessionsDataOut );
     CheckPassed( rval );
 }
 
-void TestChangePps()
+static void TestChangePps()
 {
     UINT32 rval;
 
@@ -581,13 +538,13 @@ void TestChangePps()
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nCHANGE_PPS TESTS:\n" );
+    LOG_INFO("CHANGE_PPS TESTS:" );
 
     rval = Tss2_Sys_ChangePPS( sysContext, TPM2_RH_PLATFORM, &sessionsData, &sessionsDataOut );
     CheckPassed( rval );
 }
 
-void TestHierarchyChangeAuth()
+static void TestHierarchyChangeAuth()
 {
     UINT32 rval;
     TPM2B_AUTH      newAuth;
@@ -599,7 +556,7 @@ void TestHierarchyChangeAuth()
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nHIERARCHY_CHANGE_AUTH TESTS:\n" );
+    LOG_INFO("HIERARCHY_CHANGE_AUTH TESTS:" );
 
     newAuth.size = 0;
     rval = Tss2_Sys_HierarchyChangeAuth( sysContext, TPM2_RH_PLATFORM, &sessionsData, &newAuth, 0 );
@@ -652,7 +609,7 @@ void TestHierarchyChangeAuth()
 
 #define PCR_SIZE 20
 
-void TestPcrExtend()
+static void TestPcrExtend()
 {
     UINT32 rval;
     UINT16 i, digestSize;
@@ -671,7 +628,7 @@ void TestPcrExtend()
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nPCR_EXTEND, PCR_EVENT, PCR_ALLOCATE, and PCR_READ TESTS:\n" );
+    LOG_INFO("PCR_EXTEND, PCR_EVENT, PCR_ALLOCATE, and PCR_READ TESTS:" );
 
     // Init digests
     digests.count = 1;
@@ -712,13 +669,13 @@ void TestPcrExtend()
 
     if( pcrUpdateCounterBeforeExtend == pcrUpdateCounterAfterExtend )
     {
-        DebugPrintf( NO_PREFIX, "ERROR!! pcrUpdateCounter didn't change value\n" );
+        LOG_ERROR("ERROR!! pcrUpdateCounter didn't change value" );
         Cleanup();
     }
 
     if( 0 == memcmp( &( pcrBeforeExtend[0] ), &( pcrAfterExtend[0] ), 20 ) )
     {
-        DebugPrintf( NO_PREFIX, "ERROR!! PCR didn't change value\n" );
+        LOG_ERROR("ERROR!! PCR didn't change value" );
         Cleanup();
     }
 
@@ -737,12 +694,12 @@ void TestPcrExtend()
     CheckPassed( rval );
 }
 
-void TestShutdown()
+static void TestShutdown()
 {
     UINT32 rval;
     TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
 
-    DebugPrintf( NO_PREFIX, "\nSHUTDOWN TESTS:\n" );
+    LOG_INFO("SHUTDOWN TESTS:" );
 
     rval = Tss2_Sys_Shutdown( sysContext, 0, TPM2_SU_STATE, &sessionsDataOut );
     CheckPassed( rval );
@@ -754,7 +711,7 @@ void TestShutdown()
     CheckFailed( rval, TPM2_RC_VALUE+TPM2_RC_1+TPM2_RC_P );
 }
 
-void TestNV()
+static void TestNV()
 {
     UINT32 rval;
     TPM2B_NV_PUBLIC publicInfo;
@@ -773,7 +730,7 @@ void TestNV()
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nNV INDEX TESTS:\n" );
+    LOG_INFO("NV INDEX TESTS:" );
 
     nvAuth.size = 20;
     for( i = 0; i < nvAuth.size; i++ ) {
@@ -790,11 +747,11 @@ void TestNV()
     *(UINT32 *)&( publicInfo.nvPublic.attributes ) = 0;
 
     // Now set the attributes.
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PPREAD;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PPWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_WRITE_STCLEAR;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_ORDERLY;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PPREAD;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PPWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_WRITE_STCLEAR;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PLATFORMCREATE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_ORDERLY;
     publicInfo.nvPublic.authPolicy.size = 0;
     publicInfo.nvPublic.dataSize = 32;
 
@@ -863,12 +820,12 @@ void TestNV()
     rval = Tss2_Sys_NV_UndefineSpace( sysContext, TPM2_RH_PLATFORM, TPM20_INDEX_TEST1, &sessionsData, 0 );
     CheckPassed( rval );
 
-    publicInfo.nvPublic.attributes &= ~TPMA_NV_TPMA_NV_PPREAD;
-    publicInfo.nvPublic.attributes &= ~TPMA_NV_TPMA_NV_PPWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_OWNERREAD;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_OWNERWRITE;
-    publicInfo.nvPublic.attributes &= ~TPMA_NV_TPMA_NV_PLATFORMCREATE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_ORDERLY;
+    publicInfo.nvPublic.attributes &= ~TPMA_NV_PPREAD;
+    publicInfo.nvPublic.attributes &= ~TPMA_NV_PPWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_OWNERREAD;
+    publicInfo.nvPublic.attributes |= TPMA_NV_OWNERWRITE;
+    publicInfo.nvPublic.attributes &= ~TPMA_NV_PLATFORMCREATE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_ORDERLY;
     publicInfo.nvPublic.nvIndex = TPM20_INDEX_TEST2;
     rval = Tss2_Sys_NV_DefineSpace( sysContext, TPM2_RH_OWNER, &sessionsData, &nvAuth, &publicInfo, 0 );
     CheckPassed( rval );
@@ -894,7 +851,7 @@ void TestNV()
     CheckPassed( rval );
 }
 
-void TestHierarchyControl()
+static void TestHierarchyControl()
 {
     UINT32 rval;
     TPM2B_NV_PUBLIC publicInfo;
@@ -911,7 +868,7 @@ void TestHierarchyControl()
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nHIERARCHY CONTROL TESTS:\n" );
+    LOG_INFO("HIERARCHY CONTROL TESTS:" );
 
     nvAuth.size = 20;
     for( i = 0; i < nvAuth.size; i++ ) {
@@ -928,12 +885,12 @@ void TestHierarchyControl()
     *(UINT32 *)&( publicInfo.nvPublic.attributes ) = 0;
 
     // Now set the attributes.
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PPREAD;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PPWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PPWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_WRITE_STCLEAR;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_ORDERLY;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PPREAD;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PPWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PPWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_WRITE_STCLEAR;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PLATFORMCREATE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_ORDERLY;
     publicInfo.nvPublic.authPolicy.size = 0;
     publicInfo.nvPublic.dataSize = 32;
 
@@ -978,159 +935,7 @@ void TestHierarchyControl()
     CheckPassed( rval );
 }
 
-TPM2B_PUBLIC    inPublic = {sizeof( TPM2B_PUBLIC ) - 2,};
-
-void TestCreate(){
-    UINT32 rval;
-    TPM2B_SENSITIVE_CREATE  inSensitive = {sizeof( TPM2B_SENSITIVE_CREATE ) - 2,};
-    TPM2B_DATA              outsideInfo = {sizeof( TPM2B_DATA ) - 2,};
-    TPML_PCR_SELECTION      creationPCR;
-    TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
-	TPM2B_NAME name = {sizeof( TPM2B_NAME ) - 2,};
-	TPM2B_NAME name1 = {sizeof( TPM2B_NAME ) - 2,};
-    TPM2B_PRIVATE outPrivate = {sizeof( TPM2B_PRIVATE ) - 2,};
-    TPM2B_PUBLIC outPublic = {sizeof( TPM2B_PUBLIC ) - 2,};
-    TPM2B_CREATION_DATA creationData =  {sizeof( TPM2B_CREATION_DATA ) - 2,};
-	TPM2B_DIGEST creationHash = {sizeof( TPM2B_DIGEST ) - 2,};
-	TPMT_TK_CREATION creationTicket = { 0, 0, {sizeof( TPM2B_DIGEST ) - 2,} };
-
-    TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1, .auths = {{
-        .sessionHandle = TPM2_RS_PW,
-        .sessionAttributes = 0,
-        .nonce = {.size = 0},
-        .hmac = {.size = 0}}}};
-
-    DebugPrintf( NO_PREFIX, "\nCREATE, CREATE PRIMARY, and LOAD TESTS:\n" );
-
-    inSensitive.sensitive.userAuth = loadedSha1KeyAuth;
-    inSensitive.sensitive.userAuth = loadedSha1KeyAuth;
-    inSensitive.sensitive.data.size = 0;
-    inSensitive.size = loadedSha1KeyAuth.size + 2;
-
-    inPublic.publicArea.type = TPM2_ALG_RSA;
-    inPublic.publicArea.nameAlg = TPM2_ALG_SHA1;
-
-    // First clear attributes bit field.
-    *(UINT32 *)&( inPublic.publicArea.objectAttributes) = 0;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_RESTRICTED;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_USERWITHAUTH;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_DECRYPT;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_FIXEDTPM;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_FIXEDPARENT;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_SENSITIVEDATAORIGIN;
-
-    inPublic.publicArea.authPolicy.size = 0;
-
-    inPublic.publicArea.parameters.rsaDetail.symmetric.algorithm = TPM2_ALG_AES;
-    inPublic.publicArea.parameters.rsaDetail.symmetric.keyBits.aes = 128;
-    inPublic.publicArea.parameters.rsaDetail.symmetric.mode.aes = TPM2_ALG_ECB;
-    inPublic.publicArea.parameters.rsaDetail.scheme.scheme = TPM2_ALG_NULL;
-    inPublic.publicArea.parameters.rsaDetail.keyBits = 2048;
-    inPublic.publicArea.parameters.rsaDetail.exponent = 0;
-
-    inPublic.publicArea.unique.rsa.size = 0;
-
-    outsideInfo.size = 0;
-    creationPCR.count = 0;
-
-    // Do SAPI test for non-zero sized outPublic
-    outPublic.size = 0xff;
-    creationData.size = 0;
-    INIT_SIMPLE_TPM2B_SIZE( creationHash );
-    INIT_SIMPLE_TPM2B_SIZE( name );
-    rval = Tss2_Sys_CreatePrimary( sysContext, TPM2_RH_PLATFORM, &sessionsData, &inSensitive, &inPublic,
-            &outsideInfo, &creationPCR, &handle2048rsa, &outPublic, &creationData, &creationHash,
-            &creationTicket, &name, &sessionsDataOut );
-    CheckFailed( rval, TSS2_SYS_RC_BAD_VALUE );
-
-    rval = Tss2_Sys_FlushContext( sysContext, handle2048rsa );
-    CheckPassed( rval );
-
-    outPublic.size = 0;
-    INIT_SIMPLE_TPM2B_SIZE( creationData );
-    INIT_SIMPLE_TPM2B_SIZE( creationHash );
-    INIT_SIMPLE_TPM2B_SIZE( name );
-    rval = Tss2_Sys_CreatePrimary( sysContext, TPM2_RH_PLATFORM, &sessionsData, &inSensitive, &inPublic,
-            &outsideInfo, &creationPCR, &handle2048rsa, &outPublic, &creationData, &creationHash,
-            &creationTicket, &name, &sessionsDataOut );
-    CheckFailed( rval, TSS2_SYS_RC_BAD_VALUE );
-
-    rval = Tss2_Sys_FlushContext( sysContext, handle2048rsa );
-    CheckPassed( rval );
-
-    outPublic.size = 0;
-    creationData.size = 0;
-    INIT_SIMPLE_TPM2B_SIZE( creationHash );
-    INIT_SIMPLE_TPM2B_SIZE( name );
-    rval = Tss2_Sys_CreatePrimary( sysContext, TPM2_RH_PLATFORM, &sessionsData, &inSensitive, &inPublic,
-            &outsideInfo, &creationPCR, &handle2048rsa, &outPublic, &creationData, &creationHash,
-            &creationTicket, &name, &sessionsDataOut );
-    CheckPassed( rval );
-
-    DebugPrintf( NO_PREFIX, "\nNew key successfully created in platform hierarchy (RSA 2048).  Handle: 0x%8.8x\n",
-            handle2048rsa );
-
-    sessionsData.auths[0].hmac.size = 2;
-    sessionsData.auths[0].hmac.buffer[0] = 0x00;
-    sessionsData.auths[0].hmac.buffer[1] = 0xff;
-
-    inPublic.publicArea.type = TPM2_ALG_KEYEDHASH;
-    inPublic.publicArea.objectAttributes &= ~TPMA_OBJECT_DECRYPT;
-    inPublic.publicArea.objectAttributes |= TPMA_OBJECT_SIGN;
-
-    inPublic.publicArea.parameters.keyedHashDetail.scheme.scheme = TPM2_ALG_HMAC;
-    inPublic.publicArea.parameters.keyedHashDetail.scheme.details.hmac.hashAlg = TPM2_ALG_SHA1;
-
-    inPublic.publicArea.unique.keyedHash.size = 0;
-
-    outsideInfo.size = 0;
-    outPublic.size = 0;
-    creationData.size = 0;
-    INIT_SIMPLE_TPM2B_SIZE( outPrivate );
-    INIT_SIMPLE_TPM2B_SIZE( creationHash );
-    rval = TSS2_RETRY_EXP( Tss2_Sys_Create( sysContext, handle2048rsa, &sessionsData, &inSensitive, &inPublic,
-            &outsideInfo, &creationPCR,
-            &outPrivate, &outPublic, &creationData,
-            &creationHash, &creationTicket, &sessionsDataOut ));
-    CheckPassed( rval );
-
-    INIT_SIMPLE_TPM2B_SIZE( name );
-    rval = Tss2_Sys_Load ( sysContext, handle2048rsa, &sessionsData, &outPrivate, &outPublic,
-            &loadedSha1KeyHandle, &name, &sessionsDataOut);
-    CheckPassed( rval );
-
-    rval = TpmHandleToName( loadedSha1KeyHandle, &name1 );
-    CheckPassed( rval );
-    DebugPrintf( NO_PREFIX, "Name of loaded key: " );
-    PrintSizedBuffer((TPM2B *)&name1);
-    rval = CompareTPM2B((TPM2B *)&name, (TPM2B *)&name1);
-    CheckPassed( rval );
-
-    DebugPrintf( NO_PREFIX, "\nLoaded key handle:  %8.8x\n", loadedSha1KeyHandle );
-}
-
-void TestEvict()
-{
-    TSS2_RC rval = TPM2_RC_SUCCESS;
-    TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
-    TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1, .auths = {{
-        .sessionHandle = TPM2_RS_PW,
-        .sessionAttributes = 0,
-        .nonce = {.size = 0},
-        .hmac = {.size = 0}}}};
-
-    DebugPrintf( NO_PREFIX, "\nEVICT CONTROL TESTS:\n" );
-
-    rval = Tss2_Sys_EvictControl( sysContext, TPM2_RH_PLATFORM, handle2048rsa, &sessionsData, 0x81800000, &sessionsDataOut );
-    CheckPassed( rval );
-
-    // Reset persistent key to be transitent.
-    sessionsData.auths[0].hmac.size = 0;
-    rval = Tss2_Sys_EvictControl( sysContext, TPM2_RH_PLATFORM, 0x81800000, &sessionsData, 0x81800000, &sessionsDataOut );
-    CheckPassed( rval );
-}
-
-TSS2_RC DefineNvIndex( TPMI_RH_PROVISION authHandle, TPMI_SH_AUTH_SESSION sessionAuthHandle, TPM2B_AUTH *auth, TPM2B_DIGEST *authPolicy,
+static TSS2_RC DefineNvIndex( TPMI_RH_PROVISION authHandle, TPMI_SH_AUTH_SESSION sessionAuthHandle, TPM2B_AUTH *auth, TPM2B_DIGEST *authPolicy,
     TPMI_RH_NV_INDEX nvIndex, TPMI_ALG_HASH nameAlg, TPMA_NV attributes, UINT16 size  )
 {
     TSS2_RC rval = TPM2_RC_SUCCESS;
@@ -1144,7 +949,7 @@ TSS2_RC DefineNvIndex( TPMI_RH_PROVISION authHandle, TPMI_SH_AUTH_SESSION sessio
         .nonce = {.size = 0},
         .hmac = {.size = 0}}}};
 
-    attributes |= TPMA_NV_TPMA_NV_ORDERLY;
+    attributes |= TPMA_NV_ORDERLY;
 
     // Init public info structure.
     publicInfo.nvPublic.attributes = attributes;
@@ -1169,7 +974,7 @@ typedef struct {
     TSS2_RC (*testPolicyFn )( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession );
 } POLICY_TEST_SETUP;
 
-TSS2_RC BuildPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession,
+static TSS2_RC BuildPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession,
     TSS2_RC (*buildPolicyFn )( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession, TPM2B_DIGEST *policyDigest ),
     TPM2B_DIGEST *policyDigest, bool trialSession )
 {
@@ -1212,7 +1017,7 @@ TSS2_RC BuildPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession,
     return rval;
 }
 
-TSS2_RC CreateNVIndex( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, TPM2B_DIGEST *policyDigest )
+static TSS2_RC CreateNVIndex( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, TPM2B_DIGEST *policyDigest )
 {
     TSS2_RC rval = TPM2_RC_SUCCESS;
     TPMA_LOCALITY locality;
@@ -1251,9 +1056,9 @@ TSS2_RC CreateNVIndex( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, TP
 
     // Now set the attributes.
     *(UINT32 *)( (void *)&nvAttributes ) = 0;
-    nvAttributes |= TPMA_NV_TPMA_NV_POLICYREAD;
-    nvAttributes |= TPMA_NV_TPMA_NV_POLICYWRITE;
-    nvAttributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
+    nvAttributes |= TPMA_NV_POLICYREAD;
+    nvAttributes |= TPMA_NV_POLICYWRITE;
+    nvAttributes |= TPMA_NV_PLATFORMCREATE;
 
     rval = DefineNvIndex( TPM2_RH_PLATFORM, TPM2_RS_PW, &nvAuth, policyDigest,
             TPM20_INDEX_PASSWORD_TEST, TPM2_ALG_SHA256, nvAttributes, 32  );
@@ -1266,11 +1071,12 @@ TSS2_RC CreateNVIndex( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, TP
 }
 
 
-TSS2_RC TestLocality( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
+static TSS2_RC TestLocality( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
 {
     TSS2_RC rval = TPM2_RC_SUCCESS;
     TPM2B_MAX_NV_BUFFER nvWriteData;
     TSS2L_SYS_AUTH_RESPONSE sessionsDataOut = { 1, };
+    TSS2_TCTI_CONTEXT *tctiContext;
     TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1, .auths = {{
         .sessionHandle = policySession->sessionHandle,
         .sessionAttributes = TPMA_SESSION_CONTINUESESSION,
@@ -1281,8 +1087,11 @@ TSS2_RC TestLocality( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
     // Init write data.
     nvWriteData.size = 0;
 
-    rval = SetLocality( sysContext, 2 );
-    CheckPassed( rval );
+    rval = Tss2_Sys_GetTctiContext(sysContext, &tctiContext);
+    CheckPassed(rval);
+
+    rval = Tss2_Tcti_SetLocality(tctiContext, 2);
+    CheckPassed(rval);
 
     // Do NV write using open session's policy.
     rval = Tss2_Sys_NV_Write( sysContext, TPM20_INDEX_PASSWORD_TEST,
@@ -1290,7 +1099,7 @@ TSS2_RC TestLocality( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
             &sessionsData, &nvWriteData, 0, &sessionsDataOut );
     CheckFailed( rval, TPM2_RC_LOCALITY );
 
-    rval = SetLocality( sysContext, 3 );
+    rval = Tss2_Tcti_SetLocality(tctiContext, 3);
     CheckPassed( rval );
 
     // Do NV write using open session's policy.
@@ -1327,7 +1136,7 @@ UINT8 dataBlob[] = "some data";
 TPM2_HANDLE blobHandle;
 TPM2B_AUTH blobAuth;
 
-TSS2_RC BuildPasswordPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession, TPM2B_DIGEST *policyDigest )
+static TSS2_RC BuildPasswordPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession, TPM2B_DIGEST *policyDigest )
 {
     TSS2_RC rval = TPM2_RC_SUCCESS;
 
@@ -1337,59 +1146,7 @@ TSS2_RC BuildPasswordPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION *policySessio
     return rval;
 }
 
-TSS2_RC BuildAuthValuePolicy( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession, TPM2B_DIGEST *policyDigest )
-{
-    TSS2_RC rval = TPM2_RC_SUCCESS;
-
-    rval = Tss2_Sys_PolicyAuthValue( sysContext, policySession->sessionHandle, 0, 0 );
-    CheckPassed( rval );
-
-    return rval;
-}
-
-
-TSS2_RC BuildPasswordPcrPolicy( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession, TPM2B_DIGEST *policyDigest )
-{
-    TSS2_RC rval = TPM2_RC_SUCCESS;
-    TPM2B_DIGEST pcrDigest;
-    TPML_PCR_SELECTION pcrs;
-    TPML_DIGEST pcrValues;
-    UINT32 pcrUpdateCounter;
-    TPML_PCR_SELECTION pcrSelectionOut;
-
-    pcrDigest.size = 0;
-    rval = Tss2_Sys_PolicyPassword( sysContext, policySession->sessionHandle, 0, 0 );
-    CheckPassed( rval );
-
-    pcrs.count = 1;
-    pcrs.pcrSelections[0].hash = TPM2_ALG_SHA1;
-    pcrs.pcrSelections[0].sizeofSelect = 3;
-    pcrs.pcrSelections[0].pcrSelect[0] = 0;
-    pcrs.pcrSelections[0].pcrSelect[1] = 0;
-    pcrs.pcrSelections[0].pcrSelect[2] = 0;
-    SET_PCR_SELECT_BIT( pcrs.pcrSelections[0], PCR_0 );
-    SET_PCR_SELECT_BIT( pcrs.pcrSelections[0], PCR_3 );
-
-    //
-    // Compute pcrDigest
-    //
-    // Read PCRs
-    rval = Tss2_Sys_PCR_Read( sysContext, 0, &pcrs, &pcrUpdateCounter, &pcrSelectionOut, &pcrValues, 0 );
-    CheckPassed( rval );
-
-    // Hash them together
-    INIT_SIMPLE_TPM2B_SIZE( pcrDigest );
-    rval = TpmHashSequence( policySession->authHash, pcrValues.count, &pcrValues.digests[0], &pcrDigest );
-    CheckPassed( rval );
-
-    rval = Tss2_Sys_PolicyPCR( sysContext, policySession->sessionHandle, 0, &pcrDigest, &pcrs, 0 );
-    CheckPassed( rval );
-
-    return rval;
-}
-
-
-TSS2_RC CreateDataBlob( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, TPM2B_DIGEST *policyDigest )
+static TSS2_RC CreateDataBlob( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, TPM2B_DIGEST *policyDigest )
 {
     TSS2_RC rval = TPM2_RC_SUCCESS;
     TPM2B_SENSITIVE_CREATE inSensitive;
@@ -1479,64 +1236,7 @@ TSS2_RC CreateDataBlob( TSS2_SYS_CONTEXT *sysContext, SESSION **policySession, T
     return rval;
 }
 
-TSS2_RC AuthValueUnseal( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
-{
-    TSS2_RC rval = TPM2_RC_SUCCESS;
-    TPM2B_SENSITIVE_DATA outData;
-    TSS2L_SYS_AUTH_COMMAND cmdAuthArray = { .count = 1, .auths = {{
-        .sessionHandle = policySession->sessionHandle,
-        .sessionAttributes = TPMA_SESSION_CONTINUESESSION,
-        .nonce = {.size = 0},
-        .hmac = {.size = 0}}}};
-
-    // Now try to unseal the blob without setting the HMAC.
-    // This test should fail.
-    INIT_SIMPLE_TPM2B_SIZE( outData );
-    rval = Tss2_Sys_Unseal( sysContext, blobHandle, &cmdAuthArray, &outData, 0 );
-    CheckFailed( rval, TPM2_RC_S + TPM2_RC_1 + TPM2_RC_AUTH_FAIL );
-
-    // Clear DA lockout.
-    TestDictionaryAttackLockReset();
-
-    //
-    // Now try to unseal the blob after setting the HMAC.
-    // This test should pass.
-    //
-
-    // First, call Prepare.
-    rval = Tss2_Sys_Unseal_Prepare( sysContext, blobHandle );
-    CheckPassed( rval );
-
-    rval = AddEntity( blobHandle, &blobAuth );
-    CheckPassed( rval );
-
-    // Roll nonces for command.
-    RollNonces( policySession, &cmdAuthArray.auths[0].nonce );
-
-    // Now generate the HMAC.
-    rval = ComputeCommandHmacs( sysContext,
-            blobHandle,
-            TPM2_HT_NO_HANDLE, &cmdAuthArray, 1 );
-    CheckPassed( rval );
-
-    INIT_SIMPLE_TPM2B_SIZE( outData );
-    rval = Tss2_Sys_Unseal( sysContext, blobHandle, &cmdAuthArray, &outData, 0 );
-    CheckPassed( rval );
-
-    rval = DeleteEntity( blobHandle );
-    CheckPassed( rval );
-
-    // Add test to make sure we unsealed correctly.
-
-    // Now we'll want to flush the data blob and remove it
-    // from resource manager tables.
-    rval = Tss2_Sys_FlushContext( sysContext, blobHandle );
-    CheckPassed( rval );
-
-    return rval;
-}
-
-TSS2_RC PasswordUnseal( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
+static TSS2_RC PasswordUnseal( TSS2_SYS_CONTEXT *sysContext, SESSION *policySession )
 {
     TSS2_RC rval = TPM2_RC_SUCCESS;
     TPM2B_SENSITIVE_DATA outData;
@@ -1583,13 +1283,13 @@ POLICY_TEST_SETUP policyTestSetups[] =
     { "PASSWORD", BuildPasswordPolicy, CreateDataBlob, PasswordUnseal },
 };
 
-void TestPolicy()
+static void TestPolicy()
 {
     UINT32 rval;
     unsigned int i;
     SESSION *policySession = 0;
 
-    DebugPrintf( NO_PREFIX, "\nPOLICY TESTS:\n" );
+    LOG_INFO("POLICY TESTS:" );
 
     for( i = 0; i < ( sizeof( policyTestSetups ) / sizeof( POLICY_TEST_SETUP ) ); i++ )
     {
@@ -1599,26 +1299,21 @@ void TestPolicy()
 
         rval = TPM2_RC_SUCCESS;
 
-        DebugPrintf( NO_PREFIX, "Policy Test: %s\n", policyTestSetups[i].name );
+        LOG_INFO("Policy Test: %s", policyTestSetups[i].name );
 
         // Create trial policy session and run policy commands, in order to create policyDigest.
         if( policyTestSetups[i].buildPolicyFn != 0)
         {
             rval = BuildPolicy( sysContext, &policySession, policyTestSetups[i].buildPolicyFn, &policyDigest, true );
             CheckPassed( rval );
-#ifdef DEBUG
-            DebugPrintf( NO_PREFIX, "Built policy digest:  \n" );
-            DebugPrintBuffer( NO_PREFIX, &(policyDigest.buffer[0]), policyDigest.size );
-#endif
+            LOGBLOB_DEBUG(&(policyDigest.buffer[0]), policyDigest.size, "Built policy digest:");
         }
 
         // Create entity that will use that policyDigest as authPolicy.
         if( policyTestSetups[i].createObjectFn != 0 )
         {
-#ifdef DEBUG
-            DebugPrintf( NO_PREFIX, "Policy digest used to create object:  \n" );
-            DebugPrintBuffer( NO_PREFIX, &(policyDigest.buffer[0]), policyDigest.size );
-#endif
+            LOGBLOB_DEBUG(&(policyDigest.buffer[0]), policyDigest.size,
+                    "Policy digest used to create object:");
 
             rval = ( *policyTestSetups[i].createObjectFn )( sysContext, &policySession, &policyDigest);
             CheckPassed( rval );
@@ -1630,10 +1325,8 @@ void TestPolicy()
         {
             rval = BuildPolicy( sysContext, &policySession, policyTestSetups[i].buildPolicyFn, &policyDigest, false );
             CheckPassed( rval );
-#ifdef DEBUG
-            DebugPrintf( NO_PREFIX, "Command policy digest:  \n" );
-            DebugPrintBuffer( NO_PREFIX, &(policyDigest.buffer[0]), policyDigest.size );
-#endif
+            LOGBLOB_DEBUG(&(policyDigest.buffer[0]), policyDigest.size,
+                    "Command policy digest: ");
         }
 
         if( policySession )
@@ -1659,7 +1352,7 @@ void TestPolicy()
 }
 
 #define MAX_TEST_SEQUENCES 10
-void TestHash()
+static void TestHash()
 {
     UINT32 rval;
     TPM2B_AUTH auth;
@@ -1743,7 +1436,7 @@ void TestHash()
             { 0xB3, 0xFD, 0x6A, 0xD2, 0x9F, 0xD0, 0x13, 0x52, 0xBA, 0xFC,
               0x8B, 0x22, 0xC9, 0x6D, 0x88, 0x42, 0xA3, 0x3C, 0xB0, 0xC9 };
 
-    DebugPrintf( NO_PREFIX, "\nHASH TESTS:\n" );
+    LOG_INFO("HASH TESTS:" );
 
     auth.size = 2;
     auth.buffer[0] = 0;
@@ -1771,12 +1464,12 @@ void TestHash()
 
     // Test the resulting hash.
     if (memcmp(result.buffer, goodHashValue, result.size)) {
-        DebugPrintf( NO_PREFIX, "ERROR!! resulting hash is incorrect.\n" );
+        LOG_ERROR("ERROR!! resulting hash is incorrect." );
         Cleanup();
     }
 }
 
-void TestQuote()
+static void TestQuote()
 {
     UINT32 rval;
     TPM2B_DATA qualifyingData;
@@ -1786,13 +1479,17 @@ void TestQuote()
     TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
     TPM2B_ATTEST quoted;
     TPMT_SIGNATURE signature;
-    TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1, .auths= {{
-        .sessionHandle = TPM2_RS_PW,
-        .sessionAttributes = 0,
-        .nonce={.size=0},
-        .hmac={.size=2, .buffer={0x00,0xff}}}}};
+    TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1,
+        .auths = {{
+            .sessionHandle = TPM2_RS_PW,
+            .sessionAttributes = 0,
+            .nonce = { .size = 0 },
+            .hmac = { .size = 0, .buffer={0x00} },
+        }},
+    };
+    TPM2_HANDLE handle, handle_parent;
 
-    DebugPrintf( NO_PREFIX, "\nQUOTE CONTROL TESTS:\n" );
+    LOG_INFO("QUOTE CONTROL TESTS:" );
 
     qualifyingData.size = sizeof( qualDataString );
     memcpy( &( qualifyingData.buffer[0] ), qualDataString, sizeof( qualDataString ) );
@@ -1800,7 +1497,7 @@ void TestQuote()
     inScheme.scheme = TPM2_ALG_NULL;
 
     pcrSelection.count = 1;
-    pcrSelection.pcrSelections[0].hash = TPM2_ALG_SHA1;
+    pcrSelection.pcrSelections[0].hash = TPM2_ALG_SHA256;
     pcrSelection.pcrSelections[0].sizeofSelect = 3;
 
     // Clear out PCR select bit field
@@ -1811,23 +1508,26 @@ void TestQuote()
     // Now set the PCR you want
     pcrSelection.pcrSelections[0].pcrSelect[( PCR_17/8 )] = ( 1 << ( PCR_18 % 8) );
 
+    rval = create_primary_rsa_2048_aes_128_cfb(sysContext, &handle_parent);
+    CheckPassed( rval );
+
+    rval = create_keyedhash_key (sysContext, handle_parent, &handle);
+    CheckPassed( rval );
+
     // Test with wrong type of key.
     INIT_SIMPLE_TPM2B_SIZE( quoted );
-    rval = Tss2_Sys_Quote ( sysContext, loadedSha1KeyHandle, &sessionsData, &qualifyingData, &inScheme,
+    rval = Tss2_Sys_Quote ( sysContext, handle, &sessionsData, &qualifyingData, &inScheme,
             &pcrSelection,  &quoted, &signature, &sessionsDataOut );
     CheckPassed( rval );
 
-    // Create signing key
+    rval = Tss2_Sys_FlushContext(sysContext, handle);
+    CheckPassed( rval );
 
-
-    // Now test quote operation
-//    Tpm20Quote ( ??TPMI_DH_OBJECT signHandle, TPM2B_DATA *qualifyingData,
-//    TPMT_SIG_SCHEME *inScheme, TPML_PCR_SELECTION *pcrSelect,
-//    TPMS_AUTH_COMMAND *sessionsData)
-
+    rval = Tss2_Sys_FlushContext(sysContext, handle_parent);
+    CheckPassed( rval );
 }
 
-void ProvisionOtherIndices()
+static void ProvisionOtherIndices()
 {
     UINT32 rval;
     TPMI_SH_AUTH_SESSION otherIndicesPolicyAuthHandle;
@@ -1841,7 +1541,7 @@ void ProvisionOtherIndices()
         .nonce={.size=0},
         .hmac={.size=0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nPROVISION OTHER NV INDICES:\n" );
+    LOG_INFO("PROVISION OTHER NV INDICES:" );
 
     //
     // AUX index: Write is controlled by TPM2_PolicyLocality; Read is controlled by authValue and is unrestricted since authValue is set to emptyBuffer
@@ -1861,7 +1561,7 @@ void ProvisionOtherIndices()
     CheckPassed( rval );
 
     // Now save the policy digest from the first OR branch.
-    DEBUG_PRINT_BUFFER( NO_PREFIX, &( nvPolicyHash.buffer[0] ), nvPolicyHash.size );
+    LOGBLOB_INFO(&( nvPolicyHash.buffer[0] ), nvPolicyHash.size, "nvPolicyHash");
 
     // init nvAuth
     nvAuth.size = 0;
@@ -1876,13 +1576,13 @@ void ProvisionOtherIndices()
     publicInfo.nvPublic.attributes = 0;
 
     // Now set the attributes.
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_AUTHWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_AUTHREAD;
+    publicInfo.nvPublic.attributes |= TPMA_NV_AUTHWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PLATFORMCREATE;
     // Following commented out for convenience during development.
-    // publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_POLICY_DELETE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_WRITEDEFINE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_ORDERLY;
+    // publicInfo.nvPublic.attributes |= TPMA_NV_POLICY_DELETE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_WRITEDEFINE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_ORDERLY;
 
     publicInfo.nvPublic.authPolicy.size = 0;
     publicInfo.nvPublic.dataSize = NV_PS_INDEX_SIZE;
@@ -1902,7 +1602,7 @@ void ProvisionOtherIndices()
 }
 
 
-TSS2_RC InitNvAuxPolicySession( TPMI_SH_AUTH_SESSION *nvAuxPolicySessionHandle )
+static TSS2_RC InitNvAuxPolicySession( TPMI_SH_AUTH_SESSION *nvAuxPolicySessionHandle )
 {
     TPMA_LOCALITY locality;
     TSS2_RC rval;
@@ -1919,7 +1619,7 @@ TSS2_RC InitNvAuxPolicySession( TPMI_SH_AUTH_SESSION *nvAuxPolicySessionHandle )
     return( rval );
 }
 
-void ProvisionNvAux()
+static void ProvisionNvAux()
 {
     UINT32 rval;
     TPMI_SH_AUTH_SESSION nvAuxPolicyAuthHandle;
@@ -1933,7 +1633,7 @@ void ProvisionNvAux()
         .nonce={.size=0},
         .hmac={.size=0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nPROVISION NV AUX:\n" );
+    LOG_INFO("PROVISION NV AUX:" );
 
     //
     // AUX index: Write is controlled by TPM2_PolicyLocality; Read is controlled by authValue and is unrestricted since authValue is set to emptyBuffer
@@ -1953,7 +1653,7 @@ void ProvisionNvAux()
     CheckPassed( rval );
 
     // Now save the policy digest.
-    DEBUG_PRINT_BUFFER( NO_PREFIX, &( nvPolicyHash.buffer[0] ), nvPolicyHash.size );
+    LOGBLOB_INFO(&( nvPolicyHash.buffer[0] ), nvPolicyHash.size, "nvPolicyHash");
 
     // init nvAuth
     nvAuth.size = 0;
@@ -1968,9 +1668,9 @@ void ProvisionNvAux()
     *(UINT32 *)&( publicInfo.nvPublic.attributes ) = 0;
 
     // Now set the attributes.
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_POLICYWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_AUTHREAD;
+    publicInfo.nvPublic.attributes |= TPMA_NV_POLICYWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PLATFORMCREATE;
     // Following commented out for convenience during development.
     // publicInfo.nvPublic.attributes.TPMA_NV_POLICY_DELETE = 1;
 
@@ -1989,12 +1689,13 @@ void ProvisionNvAux()
     CheckPassed( rval );
 }
 
-void TpmAuxWrite( int locality)
+static void TpmAuxWrite( int locality)
 {
     TSS2_RC rval;
     int i;
     TPMI_SH_AUTH_SESSION nvAuxPolicyAuthHandle;
     TPM2B_MAX_NV_BUFFER nvWriteData;
+    TSS2_TCTI_CONTEXT *tctiContext;
 
     rval = InitNvAuxPolicySession( &nvAuxPolicyAuthHandle );
     CheckPassed( rval );
@@ -2009,8 +1710,11 @@ void TpmAuxWrite( int locality)
     // Make sure that session terminates after NVWrite completes.
     nullSessionsData.auths[0].sessionAttributes &= ~TPMA_SESSION_CONTINUESESSION;
 
-    rval = SetLocality( sysContext, locality );
-    CheckPassed( rval );
+    rval = Tss2_Sys_GetTctiContext(sysContext, &tctiContext);
+    CheckPassed(rval);
+
+    rval = Tss2_Tcti_SetLocality(tctiContext, locality);
+    CheckPassed(rval);
 
     nullSessionsData.count = 1;
 
@@ -2018,7 +1722,7 @@ void TpmAuxWrite( int locality)
 
     {
         TSS2_RC setLocalityRval;
-        setLocalityRval = SetLocality( sysContext, 3 );
+        setLocalityRval = Tss2_Tcti_SetLocality(tctiContext, 3);
         CheckPassed( setLocalityRval );
     }
 
@@ -2039,13 +1743,14 @@ void TpmAuxWrite( int locality)
     }
 }
 
-void TpmAuxReadWriteTest()
+static void TpmAuxReadWriteTest()
 {
     UINT32 rval;
     int testLocality;
     TPM2B_MAX_NV_BUFFER nvData;
+    TSS2_TCTI_CONTEXT *tctiContext;
 
-    DebugPrintf( NO_PREFIX, "TPM AUX READ/WRITE TEST\n" );
+    LOG_INFO("TPM AUX READ/WRITE TEST" );
 
     nullSessionsData.auths[0].sessionAttributes &= ~TPMA_SESSION_CONTINUESESSION;
 
@@ -2056,23 +1761,25 @@ void TpmAuxReadWriteTest()
     }
 
     nullSessionsData.auths[0].sessionHandle = TPM2_RS_PW;
+    rval = Tss2_Sys_GetTctiContext(sysContext, &tctiContext);
+    CheckPassed(rval);
 
     // Try reading it from all localities.  They all should work.
     for( testLocality = 0; testLocality < 5; testLocality++ )
     {
-        rval = SetLocality( sysContext, testLocality );
+        rval = Tss2_Tcti_SetLocality(tctiContext, testLocality);
         CheckPassed( rval );
 
         INIT_SIMPLE_TPM2B_SIZE( nvData );
         rval = TSS2_RETRY_EXP( Tss2_Sys_NV_Read( sysContext, INDEX_AUX, INDEX_AUX, &nullSessionsData, 4, 0, &nvData, &nullSessionsDataOut ));
         CheckPassed( rval );
 
-        rval = SetLocality( sysContext, 3 );
+        rval = Tss2_Tcti_SetLocality(tctiContext, 3);
         CheckPassed( rval );
     }
 }
 
-void TpmOtherIndicesReadWriteTest()
+static void TpmOtherIndicesReadWriteTest()
 {
     UINT32 rval;
     TPM2B_MAX_NV_BUFFER nvWriteData;
@@ -2081,7 +1788,7 @@ void TpmOtherIndicesReadWriteTest()
 
     nullSessionsData.auths[0].sessionHandle = TPM2_RS_PW;
 
-    DebugPrintf( NO_PREFIX, "TPM OTHER READ/WRITE TEST\n" );
+    LOG_INFO("TPM OTHER READ/WRITE TEST" );
 
     nvWriteData.size = 4;
     for( i = 0; i < nvWriteData.size; i++ )
@@ -2102,11 +1809,11 @@ void TpmOtherIndicesReadWriteTest()
     CheckPassed( rval );
 }
 
-void NvIndexProto()
+static void NvIndexProto()
 {
     UINT32 rval;
 
-    DebugPrintf( NO_PREFIX, "\nNV INDEX PROTOTYPE TESTS:\n" );
+    LOG_INFO("NV INDEX PROTOTYPE TESTS:" );
 
 
     // AUX index: Write is controlled by TPM2_PolicyLocality; Read is controlled by authValue and is unrestricted since authValue is set to emptyBuffer
@@ -2134,7 +1841,7 @@ void NvIndexProto()
     CheckPassed( rval );
 }
 
-void TestPcrAllocate()
+static void TestPcrAllocate()
 {
     UINT32 rval;
     TPML_PCR_SELECTION  pcrSelection;
@@ -2150,7 +1857,7 @@ void TestPcrAllocate()
         .nonce={.size=0},
         .hmac={.size=0}}}};
 
-    DebugPrintf( NO_PREFIX, "\nPCR ALLOCATE TEST  :\n" );
+    LOG_INFO("PCR ALLOCATE TEST  :" );
 
     pcrSelection.count = 0;
 
@@ -2179,7 +1886,7 @@ void TestPcrAllocate()
     CheckPassed( rval );
 }
 
-void TestUnseal()
+static void TestUnseal()
 {
     UINT32 rval;
     TSS2L_SYS_AUTH_RESPONSE sessionsDataOut;
@@ -2187,13 +1894,16 @@ void TestUnseal()
     TPML_PCR_SELECTION      creationPCR;
     TPM2B_DATA              outsideInfo;
     TPM2B_PUBLIC            inPublic;
-    TPM2_HANDLE loadedObjectHandle;
+    TPM2_HANDLE loadedObjectHandle, handle_parent;
 
-    TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1, .auths= {{
-        .sessionHandle = TPM2_RS_PW,
-        .sessionAttributes = 0,
-        .nonce={.size=0},
-        .hmac={.size=2, .buffer={0x00,0xff}}}}};
+    TSS2L_SYS_AUTH_COMMAND sessionsData = { .count = 1,
+        .auths= {{
+            .sessionHandle = TPM2_RS_PW,
+            .sessionAttributes = 0,
+            .nonce={.size=0},
+            .hmac={.size=0, .buffer={0x00}}
+        }},
+    };
 
     TPM2B_PRIVATE outPrivate;
     TPM2B_PUBLIC outPublic;
@@ -2207,7 +1917,7 @@ void TestUnseal()
     const char authStr[] = "test";
     const char sensitiveData[] = "this is sensitive";
 
-    DebugPrintf( NO_PREFIX, "\nUNSEAL TEST  :\n" );
+    LOG_INFO("UNSEAL TEST  :" );
 
     inSensitive.sensitive.userAuth.size = sizeof( authStr ) - 1;
     memcpy( &( inSensitive.sensitive.userAuth.buffer[0] ), authStr, sizeof( authStr ) - 1 );
@@ -2235,9 +1945,13 @@ void TestUnseal()
 
     outPublic.size = 0;
     creationData.size = 0;
+
+    rval = create_primary_rsa_2048_aes_128_cfb(sysContext, &handle_parent);
+    CheckPassed( rval );
+
     INIT_SIMPLE_TPM2B_SIZE( creationHash );
     INIT_SIMPLE_TPM2B_SIZE( outPrivate );
-    rval = Tss2_Sys_Create( sysContext, handle2048rsa, &sessionsData, &inSensitive, &inPublic,
+    rval = Tss2_Sys_Create( sysContext, handle_parent, &sessionsData, &inSensitive, &inPublic,
             &outsideInfo, &creationPCR,
             &outPrivate, &outPublic, &creationData,
             &creationHash, &creationTicket, &sessionsDataOut );
@@ -2252,24 +1966,26 @@ void TestUnseal()
     CheckPassed( rval );
 
     INIT_SIMPLE_TPM2B_SIZE( name );
-    rval = Tss2_Sys_Load ( sysContext, handle2048rsa, &sessionsData, &outPrivate, &outPublic,
+    rval = Tss2_Sys_Load (sysContext, handle_parent, &sessionsData, &outPrivate, &outPublic,
             &loadedObjectHandle, &name, &sessionsDataOut);
-    CheckPassed( rval );
+    CheckPassed(rval);
 
     sessionsData.auths[0].hmac.size = sizeof( authStr ) - 1;
     memcpy( &( sessionsData.auths[0].hmac.buffer[0] ), authStr, sizeof( authStr ) - 1 );
 
     INIT_SIMPLE_TPM2B_SIZE( outData );
     rval = Tss2_Sys_Unseal( sysContext, loadedObjectHandle, &sessionsData, &outData, &sessionsDataOut );
-    CheckPassed( rval );
+    CheckPassed(rval);
 
-    rval = Tss2_Sys_FlushContext( sysContext, loadedObjectHandle );
+    rval = Tss2_Sys_FlushContext(sysContext, loadedObjectHandle);
+    CheckPassed(rval);
 
-    CheckPassed( rval );
+    rval = Tss2_Sys_FlushContext(sysContext, handle_parent);
+    CheckPassed(rval);
 }
 
 
-void CreatePasswordTestNV( TPMI_RH_NV_INDEX nvIndex, char * password )
+static void CreatePasswordTestNV( TPMI_RH_NV_INDEX nvIndex, char * password )
 {
     UINT32 rval;
     int i;
@@ -2299,10 +2015,10 @@ void CreatePasswordTestNV( TPMI_RH_NV_INDEX nvIndex, char * password )
     *(UINT32 *)&( publicInfo.nvPublic.attributes ) = 0;
 
     // Now set the attributes.
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_AUTHWRITE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
-    publicInfo.nvPublic.attributes |= TPMA_NV_TPMA_NV_ORDERLY;
+    publicInfo.nvPublic.attributes |= TPMA_NV_AUTHREAD;
+    publicInfo.nvPublic.attributes |= TPMA_NV_AUTHWRITE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_PLATFORMCREATE;
+    publicInfo.nvPublic.attributes |= TPMA_NV_ORDERLY;
     publicInfo.nvPublic.authPolicy.size = 0;
     publicInfo.nvPublic.dataSize = 32;
 
@@ -2314,7 +2030,7 @@ void CreatePasswordTestNV( TPMI_RH_NV_INDEX nvIndex, char * password )
 // Password used to authorize access to the NV index.
 char password[] = "test password";
 
-void PasswordTest()
+static void PasswordTest()
 {
     UINT32 rval;
     int i;
@@ -2331,7 +2047,7 @@ void PasswordTest()
 
     TPM2B_MAX_NV_BUFFER nvWriteData;
 
-    DebugPrintf( NO_PREFIX, "\nPASSWORD TESTS:\n" );
+    LOG_INFO("PASSWORD TESTS:" );
 
     // Create an NV index that will use password
     // authorizations the password will be
@@ -2382,508 +2098,7 @@ void PasswordTest()
     CheckPassed( rval );
 }
 
-
-void SimplePolicyTest()
-{
-    UINT32 rval, sessionCmdRval;
-    TPM2B_AUTH  nvAuth;
-    SESSION *nvSession = NULL, *trialPolicySession = NULL;
-    TPMA_NV nvAttributes;
-    TPM2B_DIGEST authPolicy;
-    TPM2B_NAME nvName;
-    TPM2B_MAX_NV_BUFFER nvWriteData, nvReadData;
-    UINT8 dataToWrite[] = { 0x00, 0xff, 0x55, 0xaa };
-    int i;
-    TPM2B_ENCRYPTED_SECRET encryptedSalt;
-    TPMT_SYM_DEF symmetric;
-
-    // Response authorization area.
-    TSS2L_SYS_AUTH_RESPONSE nvRspAuths;
-
-    // Command authorization area: one password session.
-    TSS2L_SYS_AUTH_COMMAND nvCmdAuths = { .count = 1, .auths= {{
-        .sessionHandle = TPM2_RS_PW,
-        .sessionAttributes = 0,
-        .nonce={.size=0},
-        .hmac={.size=0}}}};
-
-    TPM2_ALG_ID sessionAlg = TPM2_ALG_SHA256;
-    TPM2B_NONCE nonceCaller;
-
-    nonceCaller.size = 0;
-
-    DebugPrintf( NO_PREFIX, "\nSIMPLE POLICY TEST:\n" );
-
-    //
-    // Create NV index.
-    //
-
-    // Setup the NV index's authorization value.
-    nvAuth.size = 0;
-
-    // Zero sized encrypted salt, since the session
-    // is unsalted.
-    encryptedSalt.size = 0;
-
-    // No symmetric algorithm.
-    symmetric.algorithm = TPM2_ALG_NULL;
-
-    //
-    // Create the NV index's authorization policy
-    // using a trial policy session.
-    //
-    rval = StartAuthSessionWithParams( &trialPolicySession, TPM2_RH_NULL,
-            0, TPM2_RH_NULL, 0, &nonceCaller, &encryptedSalt, TPM2_SE_TRIAL,
-            &symmetric, sessionAlg, resMgrTctiContext );
-    CheckPassed( rval );
-
-    rval = Tss2_Sys_PolicyAuthValue( sysContext, trialPolicySession->sessionHandle, 0, 0 );
-    CheckPassed( rval );
-
-    // Get policy digest.
-    INIT_SIMPLE_TPM2B_SIZE( authPolicy );
-    rval = Tss2_Sys_PolicyGetDigest( sysContext, trialPolicySession->sessionHandle,
-            0, &authPolicy, 0 );
-    CheckPassed( rval );
-
-    // End the trial session by flushing it.
-    rval = Tss2_Sys_FlushContext( sysContext, trialPolicySession->sessionHandle );
-    CheckPassed( rval );
-
-    // And remove the trial policy session from sessions table.
-    rval = EndAuthSession( trialPolicySession );
-    CheckPassed( rval );
-
-    // Now set the NV index's attributes:
-    // policyRead, authWrite, and platormCreate.
-    *(UINT32 *)( (void *)&nvAttributes ) = 0;
-    nvAttributes |= TPMA_NV_TPMA_NV_POLICYREAD;
-    nvAttributes |= TPMA_NV_TPMA_NV_POLICYWRITE;
-    nvAttributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
-
-    // Create the NV index.
-    rval = DefineNvIndex( TPM2_RH_PLATFORM, TPM2_RS_PW,
-            &nvAuth, &authPolicy, TPM20_INDEX_PASSWORD_TEST,
-            sessionAlg, nvAttributes, 32  );
-    CheckPassed( rval );
-
-    // Add index and associated authorization value to
-    // entity table.  This helps when we need
-    // to calculate HMACs.
-    AddEntity( TPM20_INDEX_PASSWORD_TEST, &nvAuth );
-    CheckPassed( rval );
-
-    // Get the name of the NV index.
-    rval = TpmHandleToName(TPM20_INDEX_PASSWORD_TEST, &nvName);
-    CheckPassed( rval );
-
-    //
-    // Start real (non-trial) policy authorization session:
-    // it's an unbound and unsalted session, no symmetric
-    // encryption algorithm, and SHA256 is the session's
-    // hash algorithm.
-    //
-
-    // Zero sized encrypted salt, since the session
-    // is unsalted.
-    encryptedSalt.size = 0;
-
-    // No symmetric algorithm.
-    symmetric.algorithm = TPM2_ALG_NULL;
-
-    // Create the session.
-    // Session state (session handle, nonces, etc.) gets
-    // saved into nvSession structure for later use.
-    rval = StartAuthSessionWithParams( &nvSession, TPM2_RH_NULL,
-            0, TPM2_RH_NULL, 0, &nonceCaller, &encryptedSalt, TPM2_SE_POLICY,
-            &symmetric, sessionAlg, resMgrTctiContext );
-    CheckPassed( rval );
-
-    // Get the name of the session and save it in
-    // the nvSession structure.
-    rval = TpmHandleToName( nvSession->sessionHandle,
-            &nvSession->name );
-    CheckPassed( rval );
-
-    // Initialize NV write data.
-    nvWriteData.size = sizeof( dataToWrite );
-    for( i = 0; i < nvWriteData.size; i++ )
-    {
-        nvWriteData.buffer[i] = dataToWrite[i];
-    }
-
-    //
-    // Now setup for writing the NV index.
-    //
-
-    rval = Tss2_Sys_PolicyAuthValue( sysContext, nvSession->sessionHandle, 0, 0 );
-    CheckPassed( rval );
-
-    // Get policy digest.
-    INIT_SIMPLE_TPM2B_SIZE( authPolicy );
-    rval = Tss2_Sys_PolicyGetDigest( sysContext, trialPolicySession->sessionHandle,
-            0, &authPolicy, 0 );
-    CheckPassed( rval );
-
-    // First call prepare in order to create cpBuffer.
-    rval = Tss2_Sys_NV_Write_Prepare( sysContext, TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvWriteData, 0 );
-    CheckPassed( rval );
-
-    // Configure command authorization area, except for HMAC.
-    nvCmdAuths.auths[0].sessionHandle = nvSession->sessionHandle;
-    nvCmdAuths.auths[0].nonce.size = 1;
-    nvCmdAuths.auths[0].nonce.buffer[0] = 0xa5;
-    nvCmdAuths.auths[0].sessionAttributes = 0;
-    nvCmdAuths.auths[0].sessionAttributes |= TPMA_SESSION_CONTINUESESSION;
-
-    // Roll nonces for command
-    RollNonces( nvSession, &nvCmdAuths.auths[0].nonce );
-
-    // Complete command authorization area, by computing
-    // HMAC and setting it in nvCmdAuths.
-    rval = ComputeCommandHmacs( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvCmdAuths,
-            TPM2_RC_FAILURE );
-    CheckPassed( rval );
-
-    // Finally!!  Write the data to the NV index.
-    // If the command is successful, the command
-    // HMAC was correct.
-    sessionCmdRval = Tss2_Sys_NV_Write( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, &nvWriteData, 0, &nvRspAuths );
-    CheckPassed( sessionCmdRval );
-
-    // Roll nonces for response
-    RollNonces( nvSession, &nvRspAuths.auths[0].nonce );
-
-    if( sessionCmdRval == TPM2_RC_SUCCESS )
-    {
-        // If the command was successful, check the
-        // response HMAC to make sure that the
-        // response was received correctly.
-        rval = CheckResponseHMACs( sysContext, sessionCmdRval,
-                &nvCmdAuths, TPM20_INDEX_PASSWORD_TEST,
-                TPM20_INDEX_PASSWORD_TEST, &nvRspAuths );
-        CheckPassed( rval );
-    }
-
-    rval = Tss2_Sys_PolicyAuthValue( sysContext, nvSession->sessionHandle, 0, 0 );
-    CheckPassed( rval );
-
-    // First call prepare in order to create cpBuffer.
-    rval = Tss2_Sys_NV_Read_Prepare( sysContext, TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, sizeof( dataToWrite ), 0 );
-    CheckPassed( rval );
-
-    // Roll nonces for command
-    RollNonces( nvSession, &nvCmdAuths.auths[0].nonce );
-
-    // End the session after next command.
-    nvCmdAuths.auths[0].sessionAttributes &= ~TPMA_SESSION_CONTINUESESSION;
-
-    // Complete command authorization area, by computing
-    // HMAC and setting it in nvCmdAuths.
-    rval = ComputeCommandHmacs( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvCmdAuths,
-            TPM2_RC_FAILURE );
-    CheckPassed( rval );
-
-    // And now read the data back.
-    // If the command is successful, the command
-    // HMAC was correct.
-    INIT_SIMPLE_TPM2B_SIZE( nvReadData );
-    sessionCmdRval = Tss2_Sys_NV_Read( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, sizeof( dataToWrite ), 0,
-            &nvReadData, &nvRspAuths );
-    CheckPassed( sessionCmdRval );
-
-    // Roll nonces for response
-    RollNonces( nvSession, &nvRspAuths.auths[0].nonce );
-
-    if( sessionCmdRval == TPM2_RC_SUCCESS )
-    {
-        // If the command was successful, check the
-        // response HMAC to make sure that the
-        // response was received correctly.
-        rval = CheckResponseHMACs( sysContext, sessionCmdRval,
-                &nvCmdAuths, TPM20_INDEX_PASSWORD_TEST,
-                TPM20_INDEX_PASSWORD_TEST, &nvRspAuths );
-        CheckPassed( rval );
-    }
-
-    // Check that write and read data are equal.
-    if( memcmp( (void *)&nvReadData.buffer[0],
-            (void *)&nvWriteData.buffer[0], nvReadData.size ) )
-    {
-        DebugPrintf( NO_PREFIX, "ERROR!! read data not equal to written data\n" );
-        Cleanup();
-    }
-
-    //
-    // Now cleanup:  undefine the NV index and delete
-    // the NV index's entity table entry.
-    //
-
-    // Setup authorization for undefining the NV index.
-    nvCmdAuths.auths[0].sessionHandle = TPM2_RS_PW;
-    nvCmdAuths.auths[0].nonce.size = 0;
-    nvCmdAuths.auths[0].hmac.size = 0;
-
-    // Undefine the NV index.
-    rval = Tss2_Sys_NV_UndefineSpace( sysContext,
-            TPM2_RH_PLATFORM, TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, 0 );
-    CheckPassed( rval );
-
-    // Delete the NV index's entry in the entity table.
-    rval = DeleteEntity( TPM20_INDEX_PASSWORD_TEST );
-    CheckPassed( rval );
-}
-
-void SimpleHmacTest()
-{
-    UINT32 rval, sessionCmdRval;
-    TPM2B_AUTH  nvAuth;
-    SESSION *nvSession = NULL;
-    TPMA_NV nvAttributes;
-    TPM2B_DIGEST authPolicy;
-    TPM2B_NAME nvName;
-    TPM2B_MAX_NV_BUFFER nvWriteData, nvReadData;
-    UINT8 dataToWrite[] = { 0x00, 0xff, 0x55, 0xaa };
-    char sharedSecret[] = "shared secret";
-    int i;
-    TPM2B_ENCRYPTED_SECRET encryptedSalt;
-    TPMT_SYM_DEF symmetric;
-    TPMA_SESSION sessionAttributes;
-
-    // Response authorization area.
-    TSS2L_SYS_AUTH_RESPONSE nvRspAuths;
-
-    // Command authorization area: one password session.
-    TSS2L_SYS_AUTH_COMMAND nvCmdAuths = { .count = 1, .auths= {{
-        .sessionHandle = TPM2_RS_PW,
-        .sessionAttributes = 0,
-        .nonce={.size=0},
-        .hmac={.size=0}}}};
-
-    TPM2B_NONCE nonceCaller;
-
-    nonceCaller.size = 0;
-
-    DebugPrintf( NO_PREFIX, "\nSIMPLE HMAC SESSION TEST:\n" );
-
-    //
-    // Create NV index.
-    //
-
-    // Setup the NV index's authorization value.
-    nvAuth.size = strlen( sharedSecret );
-    for( i = 0; i < nvAuth.size; i++ )
-        nvAuth.buffer[i] = sharedSecret[i];
-
-    // Set NV index's authorization policy
-    // to zero sized policy since we won't be
-    // using policy to authorize.
-    authPolicy.size = 0;
-
-    // Now set the NV index's attributes:
-    // policyRead, authWrite, and platormCreate.
-    *(UINT32 *)( (void *)&nvAttributes ) = 0;
-    nvAttributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-    nvAttributes |= TPMA_NV_TPMA_NV_AUTHWRITE;
-    nvAttributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
-
-    // Create the NV index.
-    rval = DefineNvIndex( TPM2_RH_PLATFORM, TPM2_RS_PW,
-            &nvAuth, &authPolicy, TPM20_INDEX_PASSWORD_TEST,
-            TPM2_ALG_SHA256, nvAttributes, 32  );
-    CheckPassed( rval );
-
-    // Add index and associated authorization value to
-    // entity table.  This helps when we need
-    // to calculate HMACs.
-    AddEntity( TPM20_INDEX_PASSWORD_TEST, &nvAuth );
-    CheckPassed( rval );
-
-    // Get the name of the NV index.
-    rval = TpmHandleToName( TPM20_INDEX_PASSWORD_TEST,
-            &nvName );
-    CheckPassed( rval );
-
-    //
-    // Start HMAC authorization session:  it's an
-    // unbound and unsalted session, no symmetric
-    // encryption algorithm, and SHA256 is the session's
-    // hash algorithm.
-    //
-
-    // Zero sized encrypted salt, since the session
-    // is unsalted.
-    encryptedSalt.size = 0;
-
-    // No symmetric algorithm.
-    symmetric.algorithm = TPM2_ALG_NULL;
-
-    // Create the session.
-    // Session state (session handle, nonces, etc.) gets
-    // saved into nvSession structure for later use.
-    rval = StartAuthSessionWithParams( &nvSession, TPM2_RH_NULL,
-            0, TPM2_RH_NULL, 0, &nonceCaller, &encryptedSalt, TPM2_SE_HMAC,
-            &symmetric, TPM2_ALG_SHA256, resMgrTctiContext );
-    CheckPassed( rval );
-
-    // Get the name of the session and save it in
-    // the nvSession structure.
-    rval = TpmHandleToName( nvSession->sessionHandle,
-            &nvSession->name );
-    CheckPassed( rval );
-
-    // Initialize NV write data.
-    nvWriteData.size = sizeof( dataToWrite );
-    for( i = 0; i < nvWriteData.size; i++ )
-    {
-        nvWriteData.buffer[i] = dataToWrite[i];
-    }
-
-    //
-    // Now setup for writing the NV index.
-    //
-
-    // First call prepare in order to create cpBuffer.
-    rval = Tss2_Sys_NV_Write_Prepare( sysContext, TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvWriteData, 0 );
-    CheckPassed( rval );
-
-    // Configure command authorization area, except for HMAC.
-    nvCmdAuths.auths[0].sessionHandle = nvSession->sessionHandle;
-    nvCmdAuths.auths[0].nonce.size = 1;
-    nvCmdAuths.auths[0].nonce.buffer[0] = 0xa5;
-    *( (UINT8 *)(&sessionAttributes ) ) = 0;
-    nvCmdAuths.auths[0].sessionAttributes = 0;
-    nvCmdAuths.auths[0].sessionAttributes |= TPMA_SESSION_CONTINUESESSION;
-
-    // Roll nonces for command
-    RollNonces( nvSession, &nvCmdAuths.auths[0].nonce );
-
-    // Complete command authorization area, by computing
-    // HMAC and setting it in nvCmdAuths.
-    rval = ComputeCommandHmacs( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvCmdAuths,
-            TPM2_RC_FAILURE );
-    CheckPassed( rval );
-
-    // Finally!!  Write the data to the NV index.
-    // If the command is successful, the command
-    // HMAC was correct.
-    sessionCmdRval = Tss2_Sys_NV_Write( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, &nvWriteData, 0, &nvRspAuths );
-    CheckPassed( sessionCmdRval );
-
-    // Roll nonces for response
-    RollNonces( nvSession, &nvRspAuths.auths[0].nonce );
-
-    if( sessionCmdRval == TPM2_RC_SUCCESS )
-    {
-        // If the command was successful, check the
-        // response HMAC to make sure that the
-        // response was received correctly.
-        rval = CheckResponseHMACs( sysContext, sessionCmdRval,
-                &nvCmdAuths, TPM20_INDEX_PASSWORD_TEST,
-                TPM20_INDEX_PASSWORD_TEST, &nvRspAuths );
-        CheckPassed( rval );
-    }
-
-    // First call prepare in order to create cpBuffer.
-    rval = Tss2_Sys_NV_Read_Prepare( sysContext, TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, sizeof( dataToWrite ), 0 );
-    CheckPassed( rval );
-
-    // Roll nonces for command
-    RollNonces( nvSession, &nvCmdAuths.auths[0].nonce );
-
-    // End the session after next command.
-    nvCmdAuths.auths[0].sessionAttributes &= ~TPMA_SESSION_CONTINUESESSION;
-
-    // Complete command authorization area, by computing
-    // HMAC and setting it in nvCmdAuths.
-    rval = ComputeCommandHmacs( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvCmdAuths,
-            TPM2_RC_FAILURE );
-    CheckPassed( rval );
-
-    // And now read the data back.
-    // If the command is successful, the command
-    // HMAC was correct.
-    INIT_SIMPLE_TPM2B_SIZE( nvReadData );
-    sessionCmdRval = Tss2_Sys_NV_Read( sysContext,
-            TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, sizeof( dataToWrite ), 0,
-            &nvReadData, &nvRspAuths );
-    CheckPassed( sessionCmdRval );
-
-    // Roll nonces for response
-    RollNonces( nvSession, &nvRspAuths.auths[0].nonce );
-
-    if( sessionCmdRval == TPM2_RC_SUCCESS )
-    {
-        // If the command was successful, check the
-        // response HMAC to make sure that the
-        // response was received correctly.
-        rval = CheckResponseHMACs( sysContext, sessionCmdRval,
-                &nvCmdAuths, TPM20_INDEX_PASSWORD_TEST,
-                TPM20_INDEX_PASSWORD_TEST, &nvRspAuths );
-        CheckPassed( rval );
-    }
-
-    // Check that write and read data are equal.
-    if( memcmp( (void *)&nvReadData.buffer[0],
-            (void *)&nvWriteData.buffer[0], nvReadData.size ) )
-    {
-        DebugPrintf( NO_PREFIX, "ERROR!! read data not equal to written data\n" );
-        Cleanup();
-    }
-
-    //
-    // Now cleanup:  undefine the NV index and delete
-    // the NV index's entity table entry.
-    //
-
-    // Setup authorization for undefining the NV index.
-    nvCmdAuths.auths[0].sessionHandle = TPM2_RS_PW;
-    nvCmdAuths.auths[0].nonce.size = 0;
-    nvCmdAuths.auths[0].hmac.size = 0;
-
-    // Undefine the NV index.
-    rval = Tss2_Sys_NV_UndefineSpace( sysContext,
-            TPM2_RH_PLATFORM, TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, 0 );
-    CheckPassed( rval );
-
-    // Delete the NV index's entry in the entity table.
-    rval = DeleteEntity( TPM20_INDEX_PASSWORD_TEST );
-    CheckPassed( rval );
-
-    rval = EndAuthSession( nvSession );
-
-    CheckPassed( rval );
-
-    PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
-}
-
-
-void SimpleHmacOrPolicyTest( bool hmacTest )
+static void SimpleHmacOrPolicyTest( bool hmacTest )
 {
     UINT32 rval, sessionCmdRval;
     TPM2B_AUTH  nvAuth;
@@ -2922,14 +2137,14 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
     else
         testString = testStringPolicy;
 
-    DebugPrintf( NO_PREFIX, "\nSIMPLE %s SESSION TEST:\n", testString );
+    LOG_INFO("SIMPLE %s SESSION TEST:", testString );
+    /* If LOG_INFO is not compiled in, this variable is unused */
+    (void)(testString);
 
     // Create sysContext structure.
-    simpleTestContext = InitSysContext( 1000, resMgrTctiContext, &abiVersion );
-    if( simpleTestContext == 0 )
-    {
+    simpleTestContext = sapi_init_from_tcti_ctx(resMgrTctiContext);
+    if (simpleTestContext == NULL)
         InitSysContextFailure();
-    }
 
     // Setup the NV index's authorization value.
     nvAuth.size = strlen( sharedSecret );
@@ -2999,15 +2214,15 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
     *(UINT32 *)( &nvAttributes ) = 0;
     if( hmacTest )
     {
-        nvAttributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-        nvAttributes |= TPMA_NV_TPMA_NV_AUTHWRITE;
+        nvAttributes |= TPMA_NV_AUTHREAD;
+        nvAttributes |= TPMA_NV_AUTHWRITE;
     }
     else
     {
-        nvAttributes |= TPMA_NV_TPMA_NV_POLICYREAD;
-        nvAttributes |= TPMA_NV_TPMA_NV_POLICYWRITE;
+        nvAttributes |= TPMA_NV_POLICYREAD;
+        nvAttributes |= TPMA_NV_POLICYWRITE;
     }
-    nvAttributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
+    nvAttributes |= TPMA_NV_PLATFORMCREATE;
 
     // Create the NV index.
     rval = DefineNvIndex( TPM2_RH_PLATFORM, TPM2_RS_PW,
@@ -3023,8 +2238,9 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
 
     // Get the name of the NV index.
     rval = TpmHandleToName(
+            resMgrTctiContext,
             TPM20_INDEX_PASSWORD_TEST,
-            &nvName );
+            &nvName);
     CheckPassed( rval );
 
 
@@ -3058,7 +2274,9 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
 
     // Get the name of the session and save it in
     // the nvSession structure.
-    rval = TpmHandleToName( nvSession->sessionHandle,
+    rval = TpmHandleToName(
+            resMgrTctiContext,
+            nvSession->sessionHandle,
             &(nvSession->name) );
     CheckPassed( rval );
 
@@ -3099,32 +2317,35 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
 
     // Complete command authorization area, by computing
     // HMAC and setting it in nvCmdAuths.
-    rval = ComputeCommandHmacs( simpleTestContext,
+    rval = ComputeCommandHmacs(
+            simpleTestContext,
             TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvCmdAuths,
-            TPM2_RC_FAILURE );
-    CheckPassed( rval );
+            TPM20_INDEX_PASSWORD_TEST,
+            &nvCmdAuths);
+    CheckPassed(rval);
     // Finally!!  Write the data to the NV index.
     // If the command is successful, the command
     // HMAC was correct.
-    sessionCmdRval = Tss2_Sys_NV_Write( simpleTestContext,
+    sessionCmdRval = Tss2_Sys_NV_Write(simpleTestContext,
             TPM20_INDEX_PASSWORD_TEST,
             TPM20_INDEX_PASSWORD_TEST,
-            &nvCmdAuths, &nvWriteData, 0, &nvRspAuths );
-    CheckPassed( sessionCmdRval );
+            &nvCmdAuths, &nvWriteData, 0, &nvRspAuths);
+    CheckPassed(sessionCmdRval);
 
     // Roll nonces for response
     RollNonces( nvSession, &nvRspAuths.auths[0].nonce );
 
-    if( sessionCmdRval == TPM2_RC_SUCCESS )
-    {
+    if (sessionCmdRval == TPM2_RC_SUCCESS) {
         // If the command was successful, check the
         // response HMAC to make sure that the
         // response was received correctly.
-        rval = CheckResponseHMACs( simpleTestContext, sessionCmdRval,
-                &nvCmdAuths, TPM20_INDEX_PASSWORD_TEST,
-                TPM20_INDEX_PASSWORD_TEST, &nvRspAuths );
-        CheckPassed( rval );
+        rval = CheckResponseHMACs(
+                simpleTestContext,
+                &nvCmdAuths,
+                TPM20_INDEX_PASSWORD_TEST,
+                TPM20_INDEX_PASSWORD_TEST,
+                &nvRspAuths);
+        CheckPassed(rval);
     }
 
     if( !hmacTest )
@@ -3149,11 +2370,12 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
 
     // Complete command authorization area, by computing
     // HMAC and setting it in nvCmdAuths.
-    rval = ComputeCommandHmacs( simpleTestContext,
+    rval = ComputeCommandHmacs(
+            simpleTestContext,
             TPM20_INDEX_PASSWORD_TEST,
-            TPM20_INDEX_PASSWORD_TEST, &nvCmdAuths,
-            TPM2_RC_FAILURE );
-    CheckPassed( rval );
+            TPM20_INDEX_PASSWORD_TEST,
+            &nvCmdAuths);
+    CheckPassed(rval);
 
     // And now read the data back.
     // If the command is successful, the command
@@ -3169,22 +2391,24 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
     // Roll nonces for response
     RollNonces( nvSession, &nvRspAuths.auths[0].nonce );
 
-    if( sessionCmdRval == TPM2_RC_SUCCESS )
-    {
+    if (sessionCmdRval == TPM2_RC_SUCCESS) {
         // If the command was successful, check the
         // response HMAC to make sure that the
         // response was received correctly.
-        rval = CheckResponseHMACs( simpleTestContext, sessionCmdRval,
-                &nvCmdAuths, TPM20_INDEX_PASSWORD_TEST,
-                TPM20_INDEX_PASSWORD_TEST, &nvRspAuths );
-        CheckPassed( rval );
+        rval = CheckResponseHMACs(
+                simpleTestContext,
+                &nvCmdAuths,
+                TPM20_INDEX_PASSWORD_TEST,
+                TPM20_INDEX_PASSWORD_TEST,
+                &nvRspAuths );
+        CheckPassed(rval);
     }
 
     // Check that write and read data are equal.
     if( memcmp( (void *)&nvReadData.buffer[0],
             (void *)&nvWriteData.buffer[0], nvReadData.size ) )
     {
-        DebugPrintf( NO_PREFIX, "ERROR!! read data not equal to written data\n" );
+        LOG_ERROR("ERROR!! read data not equal to written data" );
         Cleanup();
     }
 
@@ -3210,16 +2434,12 @@ void SimpleHmacOrPolicyTest( bool hmacTest )
 
     // Remove the real session from sessions table.
     rval = EndAuthSession( nvSession );
+    CheckPassed(rval);
 
-    CheckPassed( rval );
-
-    TeardownSysContext( &simpleTestContext );
-
+    sapi_teardown(simpleTestContext);
 }
 
-UINT32 writeDataString = 0xdeadbeef;
-
-void TestEncryptDecryptSession()
+static void TestEncryptDecryptSession()
 {
     TSS2_RC             rval = TSS2_RC_SUCCESS;
     SESSION             *encryptDecryptSession = NULL;
@@ -3236,6 +2456,7 @@ void TestEncryptDecryptSession()
     TPMA_NV             nvAttributes;
     int                 i;
     TPM2B_NONCE         nonceCaller;
+    UINT32 writeDataString = 0xdeadbeef;
 
     nonceCaller.size = 0;
 
@@ -3246,7 +2467,7 @@ void TestEncryptDecryptSession()
         .nonce={.size=0},
         .hmac={.size=0}}}};
 
-    DebugPrintf( NO_PREFIX, "\n\nDECRYPT/ENCRYPT SESSION TESTS:\n" );
+    LOG_INFO("\nDECRYPT/ENCRYPT SESSION TESTS:" );
 
     writeData.size = sizeof( writeDataString );
     memcpy( (void *)&writeData.buffer, (void *)&writeDataString,
@@ -3255,9 +2476,9 @@ void TestEncryptDecryptSession()
 
     // Create NV index with empty auth value.
     *(UINT32 *)( (void *)&nvAttributes ) = 0;
-    nvAttributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-    nvAttributes |= TPMA_NV_TPMA_NV_AUTHWRITE;
-    nvAttributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
+    nvAttributes |= TPMA_NV_AUTHREAD;
+    nvAttributes |= TPMA_NV_AUTHWRITE;
+    nvAttributes |= TPMA_NV_PLATFORMCREATE;
 
     // No authorization required.
     authPolicy.size = 0;
@@ -3311,7 +2532,7 @@ void TestEncryptDecryptSession()
         // this tests different cases for SetDecryptParam function.
         //
 
-        // Prepare the input parameters, using unencypted
+        // Prepare the input parameters, using unencrypted
         // write data.  This will be encrypted before the
         // command is sent to the TPM.
         rval = Tss2_Sys_NV_Write_Prepare( sysContext,
@@ -3334,7 +2555,7 @@ void TestEncryptDecryptSession()
                 encryptDecryptSession->sessionHandle;
         nvRdWrCmdAuths.auths[1].nonce.size = 0;
         nvRdWrCmdAuths.auths[1].sessionAttributes = 0;
-        nvRdWrCmdAuths.auths[1].sessionAttributes |= 
+        nvRdWrCmdAuths.auths[1].sessionAttributes |=
                 TPMA_SESSION_CONTINUESESSION;
         nvRdWrCmdAuths.auths[1].sessionAttributes |= TPMA_SESSION_DECRYPT;
         nvRdWrCmdAuths.auths[1].hmac.size = 0;
@@ -3354,7 +2575,7 @@ void TestEncryptDecryptSession()
             // param; decryptParamSize should be 0.
             if( decryptParamSize != 0 )
             {
-                DebugPrintf( NO_PREFIX, "ERROR!! decryptParamSize != 0\n" );
+                LOG_ERROR("ERROR!! decryptParamSize != 0" );
                 Cleanup();
             }
         }
@@ -3382,7 +2603,7 @@ void TestEncryptDecryptSession()
         rval = Tss2_Sys_ExecuteFinish( sysContext, TSS2_TCTI_TIMEOUT_BLOCK );
         CheckPassed( rval );
 
-        rval = Tss2_Sys_GetRspAuths( sysContext, &nvRdWrRspAuths );
+        rval = Tss2_Sys_GetRspAuths(sysContext, &nvRdWrRspAuths);
         CheckPassed( rval );
 
         // Roll the nonces for response
@@ -3415,10 +2636,12 @@ void TestEncryptDecryptSession()
         // verifies that the decrypt session was setup correctly.
         // If it wasn't, the data stored in the TPM would still
         // be encrypted, and this test would fail.
-        if( memcmp( (void *)&readData.buffer[0],
-                (void *)&writeData.buffer[0], readData.size ) )
+        if (memcmp((void *)readData.buffer,
+                (void *)writeData.buffer, readData.size))
         {
-            DebugPrintf( NO_PREFIX, "ERROR!! read data not equal to written data\n" );
+            LOG_ERROR("ERROR!! read data not equal to written data" );
+            LOGBLOB_ERROR(writeData.buffer, writeData.size, "written");
+            LOGBLOB_ERROR(readData.buffer, readData.size, "read");
             Cleanup();
         }
 
@@ -3437,7 +2660,7 @@ void TestEncryptDecryptSession()
 
         nvRdWrCmdAuths.auths[1].sessionAttributes &= ~TPMA_SESSION_DECRYPT;
         nvRdWrCmdAuths.auths[1].sessionAttributes |= TPMA_SESSION_ENCRYPT;
-        nvRdWrCmdAuths.auths[1].sessionAttributes |= 
+        nvRdWrCmdAuths.auths[1].sessionAttributes |=
                 TPMA_SESSION_CONTINUESESSION;
 
         rval = Tss2_Sys_SetCmdAuths( sysContext, &nvRdWrCmdAuths );
@@ -3484,14 +2707,14 @@ void TestEncryptDecryptSession()
         rval = Tss2_Sys_NV_Read_Complete( sysContext, &readData );
         CheckPassed( rval );
 
-        DebugPrintf( NO_PREFIX, "Decrypted read data = " );
-        DEBUG_PRINT_BUFFER( NO_PREFIX, &readData.buffer[0], (UINT32 )readData.size );
+        LOGBLOB_INFO(&readData.buffer[0], (UINT32 )readData.size,
+                "Decrypted read data = ");
 
         // Check that write and read data are equal.
         if( memcmp( (void *)&readData.buffer[0],
                 (void *)&writeData.buffer[0], readData.size ) )
         {
-            DebugPrintf( NO_PREFIX, "ERROR!! read data not equal to written data\n" );
+            LOG_ERROR("ERROR!! read data not equal to written data" );
             Cleanup();
         }
 
@@ -3509,7 +2732,7 @@ void TestEncryptDecryptSession()
     CheckPassed( rval );
 }
 
-void GetSetDecryptParamTests()
+static void GetSetDecryptParamTests()
 {
     TPM2B_MAX_NV_BUFFER nvWriteData = {4, { 0xde, 0xad, 0xbe, 0xef,} };
     TPM2B_MAX_NV_BUFFER nvWriteData1 = {4, { 0x01, 0x01, 0x02, 0x03,} };
@@ -3521,14 +2744,12 @@ void GetSetDecryptParamTests()
     int i;
     TSS2_SYS_CONTEXT *decryptParamTestSysContext;
 
-    DebugPrintf( NO_PREFIX, "\nGET/SET DECRYPT PARAM TESTS:\n" );
+    LOG_INFO("GET/SET DECRYPT PARAM TESTS:" );
 
     // Create two sysContext structures.
-    decryptParamTestSysContext = InitSysContext( TPM2_MAX_NV_BUFFER_SIZE, resMgrTctiContext, &abiVersion );
-    if( decryptParamTestSysContext == 0 )
-    {
+    decryptParamTestSysContext = sapi_init_from_tcti_ctx(resMgrTctiContext);
+    if (decryptParamTestSysContext == NULL)
         InitSysContextFailure();
-    }
 
     // Test for bad sequence:  Tss2_Sys_GetDecryptParam
     rval = Tss2_Sys_GetDecryptParam( decryptParamTestSysContext, &decryptParamSize, &decryptParamBuffer );
@@ -3583,7 +2804,7 @@ void GetSetDecryptParamTests()
     {
         if( decryptParamBuffer[i] != nvWriteData.buffer[i] )
         {
-            DebugPrintf( NO_PREFIX, "ERROR!!  decryptParamBuffer[%d] s/b: %2.2x, was: %2.2x\n", i, nvWriteData.buffer[i], decryptParamBuffer[i] );
+            LOG_ERROR("ERROR!!  decryptParamBuffer[%d] s/b: %2.2x, was: %2.2x", i, nvWriteData.buffer[i], decryptParamBuffer[i] );
             Cleanup();
         }
     }
@@ -3591,10 +2812,7 @@ void GetSetDecryptParamTests()
     rval = Tss2_Sys_GetCpBuffer( decryptParamTestSysContext, &cpBufferUsedSize1, &cpBuffer1 );
     CheckPassed( rval );
 
-#ifdef DEBUG
-    DebugPrintf( NO_PREFIX, "cpBuffer = ");
-#endif
-    DEBUG_PRINT_BUFFER( NO_PREFIX, (UINT8 *)cpBuffer1, cpBufferUsedSize1 );
+    LOGBLOB_DEBUG((UINT8 *)cpBuffer1, cpBufferUsedSize1, "cpBuffer = ");
 
     // Test for no decrypt param.
     rval = Tss2_Sys_NV_Read_Prepare( decryptParamTestSysContext, TPM20_INDEX_PASSWORD_TEST, TPM20_INDEX_PASSWORD_TEST, sizeof( nvWriteData ) - 2, 0 );
@@ -3617,24 +2835,23 @@ void GetSetDecryptParamTests()
     // Check that size == 0.
     if( decryptParamSize != 0 )
     {
-        DebugPrintf( NO_PREFIX, "ERROR!!  decryptParamSize s/b: 0, was: %u\n", (unsigned int)decryptParamSize );
+        LOG_ERROR("ERROR!!  decryptParamSize s/b: 0, was: %u", (unsigned int)decryptParamSize );
         Cleanup();
     }
 
     // Test for insufficient size.
-    rval = Tss2_Sys_GetCpBuffer( decryptParamTestSysContext, &cpBufferUsedSize2, &cpBuffer2 );
-    CheckPassed( rval );
-    nvWriteData.size = TPM2_MAX_NV_BUFFER_SIZE -
+    rval = Tss2_Sys_GetCpBuffer(decryptParamTestSysContext, &cpBufferUsedSize2, &cpBuffer2);
+    CheckPassed(rval);
+    nvWriteData.size = TPM2_MAX_COMMAND_SIZE -
             BE_TO_HOST_32(((TPM20_Header_In *)(((_TSS2_SYS_CONTEXT_BLOB *)decryptParamTestSysContext)->cmdBuffer))->commandSize) + 1;
 
-    rval = Tss2_Sys_SetDecryptParam( decryptParamTestSysContext, nvWriteData.size, &( nvWriteData.buffer[0] ) );
-    CheckFailed( rval, TSS2_SYS_RC_INSUFFICIENT_CONTEXT );
+    rval = Tss2_Sys_SetDecryptParam(decryptParamTestSysContext, nvWriteData.size, nvWriteData.buffer);
+    CheckFailed(rval, TSS2_SYS_RC_INSUFFICIENT_CONTEXT);
 
     // Test that one less will work.  This tests that we're checking the correct corner case.
     nvWriteData.size -= 1;
-    rval = Tss2_Sys_SetDecryptParam( decryptParamTestSysContext, nvWriteData.size, &( nvWriteData.buffer[0] ) );
-    CheckPassed( rval );
-
+    rval = Tss2_Sys_SetDecryptParam(decryptParamTestSysContext, nvWriteData.size, nvWriteData.buffer);
+    CheckPassed(rval);
 
     rval = Tss2_Sys_NV_Write_Prepare( decryptParamTestSysContext, TPM20_INDEX_PASSWORD_TEST,
             TPM20_INDEX_PASSWORD_TEST, 0, 0x55aa );
@@ -3649,21 +2866,18 @@ void GetSetDecryptParamTests()
     rval = Tss2_Sys_GetCpBuffer( decryptParamTestSysContext, &cpBufferUsedSize2, &cpBuffer2 );
     CheckPassed( rval );
 
-#ifdef DEBUG
-    DebugPrintf( NO_PREFIX, "cpBuffer = ");
-#endif
-    DEBUG_PRINT_BUFFER( NO_PREFIX, (UINT8 *)cpBuffer2, cpBufferUsedSize2 );
+    LOGBLOB_INFO((UINT8 *)cpBuffer2, cpBufferUsedSize2, "cpBuffer = ");
 
     if( cpBufferUsedSize1 != cpBufferUsedSize2 )
     {
-        DebugPrintf( NO_PREFIX, "ERROR!!  cpBufferUsedSize1(%x) != cpBufferUsedSize2(%x)\n", (UINT32)cpBufferUsedSize1, (UINT32)cpBufferUsedSize2 );
+        LOG_ERROR("ERROR!!  cpBufferUsedSize1(%x) != cpBufferUsedSize2(%x)", (UINT32)cpBufferUsedSize1, (UINT32)cpBufferUsedSize2 );
         Cleanup();
     }
     for( i = 0; i < (int)cpBufferUsedSize1; i++ )
     {
         if( cpBuffer1[i] != cpBuffer2[i] )
         {
-            DebugPrintf( NO_PREFIX, "ERROR!! cpBufferUsedSize1[%d] s/b: %2.2x, was: %2.2x\n", i, cpBuffer1[i], cpBuffer2[i] );
+            LOG_ERROR("ERROR!! cpBufferUsedSize1[%d] s/b: %2.2x, was: %2.2x", i, cpBuffer1[i], cpBuffer2[i] );
             Cleanup();
         }
     }
@@ -3677,66 +2891,60 @@ void GetSetDecryptParamTests()
     rval = Tss2_Sys_SetDecryptParam( decryptParamTestSysContext, 1, &( nvWriteData.buffer[0] ) );
     CheckFailed( rval, TSS2_SYS_RC_BAD_SIZE );
 
-    TeardownSysContext( &decryptParamTestSysContext );
+    sapi_teardown(decryptParamTestSysContext);
 }
 
-void SysFinalizeTests()
+static void SysFinalizeTests()
 {
-    DebugPrintf( NO_PREFIX, "\nSYS FINALIZE TESTS:\n" );
+    LOG_INFO("SYS FINALIZE TESTS:" );
 
     Tss2_Sys_Finalize( 0 );
 
     // Note:  other cases tested by other tests.
 }
 
-void GetContextSizeTests()
+static void GetContextSizeTests()
 {
     TSS2_RC rval = TSS2_RC_SUCCESS;
     TSS2_SYS_CONTEXT *testSysContext;
 
-    DebugPrintf( NO_PREFIX, "\nSYS GETCONTEXTSIZE TESTS:\n" );
+    LOG_INFO("SYS GETCONTEXTSIZE TESTS:" );
 
-    testSysContext = InitSysContext( 9, resMgrTctiContext, &abiVersion );
-    if( testSysContext == 0 )
-    {
+    testSysContext = sapi_init_from_tcti_ctx(resMgrTctiContext);
+    if (testSysContext == NULL)
         InitSysContextFailure();
-    }
 
-    rval = Tss2_Sys_Startup( testSysContext, TPM2_SU_CLEAR );
-    CheckFailed( rval, TSS2_TYPES_RC_INSUFFICIENT_BUFFER );
+    rval = Tss2_Sys_Startup(testSysContext, TPM2_SU_CLEAR);
+    CheckPassed(rval);
 
-	rval = Tss2_Sys_GetTestResult_Prepare( testSysContext );
-	CheckPassed( rval );
+	rval = Tss2_Sys_GetTestResult_Prepare(testSysContext);
+	CheckPassed(rval);
 
-    // Note:  other cases tested by other tests.
-
-    TeardownSysContext( &testSysContext );
+    sapi_teardown(testSysContext);
 }
 
-void GetTctiContextTests()
+static void GetTctiContextTests()
 {
     TSS2_RC rval = TSS2_RC_SUCCESS;
     TSS2_SYS_CONTEXT *testSysContext;
     TSS2_TCTI_CONTEXT *tctiContext;
 
-    DebugPrintf( NO_PREFIX, "\nSYS GETTCTICONTEXT TESTS:\n" );
+    LOG_INFO("SYS GETTCTICONTEXT TESTS:" );
 
-    testSysContext = InitSysContext( 9, resMgrTctiContext, &abiVersion );
-    if( testSysContext == 0 )
-    {
+    testSysContext = sapi_init_from_tcti_ctx(resMgrTctiContext);
+    if (testSysContext == NULL)
         InitSysContextFailure();
-    }
 
-    rval = Tss2_Sys_GetTctiContext( testSysContext, 0 );
-    CheckFailed( rval, TSS2_SYS_RC_BAD_REFERENCE );
+    rval = Tss2_Sys_GetTctiContext(testSysContext, 0);
+    CheckFailed(rval, TSS2_SYS_RC_BAD_REFERENCE);
 
-    rval = Tss2_Sys_GetTctiContext( 0, &tctiContext );
-    CheckFailed( rval, TSS2_SYS_RC_BAD_REFERENCE );
+    rval = Tss2_Sys_GetTctiContext(0, &tctiContext);
+    CheckFailed(rval, TSS2_SYS_RC_BAD_REFERENCE);
 
-    TeardownSysContext( &testSysContext );
+    sapi_teardown(testSysContext);
 }
 
-void GetSetEncryptParamTests()
+static void GetSetEncryptParamTests()
 {
     TPM2B_MAX_NV_BUFFER nvWriteData = {4, { 0xde, 0xad, 0xbe, 0xef,} };
     const uint8_t *encryptParamBuffer;
@@ -3755,7 +2963,7 @@ void GetSetEncryptParamTests()
     TPM2B_MAX_NV_BUFFER nvReadData;
     const uint8_t 		*cpBuffer;
 
-    DebugPrintf( NO_PREFIX, "\nGET/SET ENCRYPT PARAM TESTS:\n" );
+    LOG_INFO("GET/SET ENCRYPT PARAM TESTS:" );
 
     // Do Prepare.
     rval = Tss2_Sys_NV_Write_Prepare( sysContext, TPM20_INDEX_PASSWORD_TEST,
@@ -3777,9 +2985,9 @@ void GetSetEncryptParamTests()
 
     // Now set the attributes.
     *(UINT32 *)( (void *)&nvAttributes ) = 0;
-    nvAttributes |= TPMA_NV_TPMA_NV_AUTHREAD;
-    nvAttributes |= TPMA_NV_TPMA_NV_AUTHWRITE;
-    nvAttributes |= TPMA_NV_TPMA_NV_PLATFORMCREATE;
+    nvAttributes |= TPMA_NV_AUTHREAD;
+    nvAttributes |= TPMA_NV_AUTHWRITE;
+    nvAttributes |= TPMA_NV_PLATFORMCREATE;
 
     rval = DefineNvIndex( TPM2_RH_PLATFORM, TPM2_RS_PW, &nvAuth, &authPolicy,
             TPM20_INDEX_PASSWORD_TEST, TPM2_ALG_SHA1, nvAttributes, 32  );
@@ -3790,7 +2998,7 @@ void GetSetEncryptParamTests()
             TPM20_INDEX_PASSWORD_TEST, &nvWriteData, 0 );
     CheckPassed( rval ); // #5
 
-    // NOTE: add GetCpBuffer tests here, just because its easier.
+    // NOTE: add GetCpBuffer tests here, just because it's easier.
     rval = Tss2_Sys_GetCpBuffer( 0, (size_t *)4, (const uint8_t **)4 );
 	CheckFailed( rval, TSS2_SYS_RC_BAD_REFERENCE ); // #6
 
@@ -3867,7 +3075,7 @@ void GetSetEncryptParamTests()
     {
         if( encryptParamBuffer[i] != encryptParamBuffer1[i] )
         {
-            DebugPrintf( NO_PREFIX, "ERROR!! encryptParamBuffer[%d] s/b: %2.2x, was: %2.2x\n", i, encryptParamBuffer[i], encryptParamBuffer1[i] );
+            LOG_ERROR("ERROR!! encryptParamBuffer[%d] s/b: %2.2x, was: %2.2x", i, encryptParamBuffer[i], encryptParamBuffer1[i] );
             Cleanup();
         }
     }
@@ -3893,13 +3101,13 @@ void GetSetEncryptParamTests()
     CheckFailed( rval, TSS2_SYS_RC_BAD_REFERENCE ); // #29
 }
 
-void EcEphemeralTest()
+static void EcEphemeralTest()
 {
     TSS2_RC rval = TSS2_RC_SUCCESS;
     TPM2B_ECC_POINT Q;
     UINT16 counter;
 
-    DebugPrintf( NO_PREFIX, "\nEC Ephemeral TESTS:\n" );
+    LOG_INFO("EC Ephemeral TESTS:" );
 
     // Test SAPI for case of Q size field not being set to 0.
     INIT_SIMPLE_TPM2B_SIZE( Q );
@@ -3924,6 +3132,7 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
         return 1;
     }
 
+    nullSessionsData.auths[0].sessionHandle = TPM2_RS_PW;
     nullSessionsDataOut.count = 1;
     nullSessionsDataOut.auths[0].nonce = nullSessionNonceOut;
     nullSessionsDataOut.auths[0].hmac = nullSessionHmac;
@@ -3934,12 +3143,13 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     loadedSha1KeyAuth.buffer[0] = 0x00;
     loadedSha1KeyAuth.buffer[1] = 0xff;
 
-    rval = PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
-    CheckPassed( rval );
+    rval = tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_OFF );
+    CheckPassed(rval);
+
+    rval = tcti_platform_command( resMgrTctiContext, MS_SIM_POWER_ON );
+    CheckPassed(rval);
 
     InitEntities();
-
-    InitNullSession( &nullSessionsData.auths[0]);
 
     SysFinalizeTests();
 
@@ -3957,7 +3167,6 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     // Clear DA lockout.
     TestDictionaryAttackLockReset();
     TestDictionaryAttackLockReset();
-    TestCreate();
     TestHierarchyControl();
     NvIndexProto();
     GetSetEncryptParamTests();
@@ -3973,8 +3182,6 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     TestHierarchyChangeAuth();
     TestShutdown();
     TestNV();
-    TestCreate();
-    TestEvict();
     NvIndexProto();
     PasswordTest();
     TestQuote();
@@ -3982,12 +3189,5 @@ test_invoke (TSS2_SYS_CONTEXT *sapi_context)
     TestPcrAllocate();
     TestUnseal();
     EcEphemeralTest();
-    // Clear out RM entries for objects.
-    rval = Tss2_Sys_FlushContext( sysContext, handle2048rsa );
-    CheckPassed( rval );
-    rval = Tss2_Sys_FlushContext( sysContext, loadedSha1KeyHandle );
-    CheckPassed( rval );
-
-    PlatformCommand( resMgrTctiContext, MS_SIM_POWER_OFF );
     return 0;
 }
