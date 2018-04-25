@@ -58,9 +58,6 @@ AS_IF([test "x$enable_unit" != xno],
                          [AC_MSG_ERROR([cmocka_err])])])
 AM_CONDITIONAL([UNIT], [test "x$enable_unit" != xno])
 
-# Uriparser library required by simulator TCTI library.
-PKG_CHECK_MODULES([URIPARSER],[liburiparser])
-
 AC_ARG_ENABLE([esapi],
             [AS_HELP_STRING([--enable-esapi],
                             [build the esapi layer (default is yes)])],
@@ -94,6 +91,19 @@ AC_ARG_WITH([tctidefaultconfig],
             [])
 
 #
+# udev
+#
+AC_ARG_WITH([udevrulesdir],
+            [AS_HELP_STRING([--with-udevrulesdir=DIR],[udev rules directory])],
+            [],
+            [with_udevrulesdir=${libdir}/udev/rules.d])
+AX_NORMALIZE_PATH([with_udevrulesdir])
+AC_SUBST([udevrulesdir], [$with_udevrulesdir])
+AC_ARG_WITH([udevrulesprefix],
+            [AS_HELP_STRING([--with-udevrulesprefix=XY],[prefix for udev rules file])],
+            [AC_SUBST([udevrulesprefix],[$with_udevrulesprefix])])
+AM_CONDITIONAL(WITH_UDEVRULESPREFIX, [test -n "$with_udevrulesprefix"])
+#
 # simulator binary
 #
 AC_MSG_CHECKING([Checking for simulator binary: $with_simulatorbin])
@@ -110,6 +120,9 @@ AM_CONDITIONAL([SIMULATOR_BIN],[test "x$with_simulatorbin_set" = "xyes"])
 
 AS_IF([test "x$with_simulatorbin_set" == xyes],
       [PKG_CHECK_MODULES([LIBCRYPTO],[libcrypto])])
+
+AS_IF([test "x$with_simulatorbin_set" == xyes],
+      [AC_CHECK_HEADER(uthash.h, [], [AC_MSG_ERROR([Can not find uthash.h. Please install uthash-dev])])])
 
 gl_LD_VERSION_SCRIPT
 

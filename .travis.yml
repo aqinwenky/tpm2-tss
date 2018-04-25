@@ -25,10 +25,10 @@ addons:
     - autoconf-archive
     - cmake
     - libgcrypt20-dev
-    - liburiparser-dev
     - realpath
     - lcov
     - libssl-dev
+    - uthash-dev
   coverity_scan:
     project:
       name: "01org/TPM2.0-TSS"

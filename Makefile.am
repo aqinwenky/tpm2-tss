@@ -56,6 +56,9 @@ include src_vars.mk
 include Makefile-test.am
 
 ### Distribution files ###
+# Add udev rule
+udevrules_DATA   = dist/tpm-udev.rules
+
 # Adding user and developer information
 EXTRA_DIST += \
     CHANGELOG.md \
@@ -178,6 +181,16 @@ man/man3/%.3 : man/%.3.in $(srcdir)/man/man-postlude.troff
 
 man/man7/%.7 : man/%.7.in $(srcdir)/man/man-postlude.troff
 	$(AM_V_GEN)$(call make_man,$@,$<,$(srcdir)/man/man-postlude.troff)
+
+EXTRA_DIST += dist/tpm-udev.rules
+
+if WITH_UDEVRULESPREFIX
+install-data-hook:
+	mv $(DESTDIR)$(udevrulesdir)/tpm-udev.rules $(DESTDIR)$(udevrulesdir)/$(udevrulesprefix)tpm-udev.rules
+
+uninstall-local:
+	-rm $(DESTDIR)$(udevrulesdir)/$(udevrulesprefix)tpm-udev.rules
+endif
 
 EXTRA_DIST += \
     man/man-postlude.troff \
