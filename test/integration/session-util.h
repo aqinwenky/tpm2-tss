@@ -1,5 +1,7 @@
-/*
- * Copyright (c) 2017, Intel Corporation
+/***********************************************************************
+ * Copyright (c) 2017-2018, Intel Corporation
+ *
+ * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -22,8 +24,7 @@
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
  * THE POSSIBILITY OF SUCH DAMAGE.
- */
-
+ ***********************************************************************/
 #ifndef _SESSION_UTIL_H_
 #define _SESSION_UTIL_H_
 
@@ -66,7 +67,7 @@ typedef struct{
  * otherwise rpHash rpHash is calculated.
  */
 TSS2_RC
-TpmCalcPHash(
+tpm_calc_phash(
     TSS2_SYS_CONTEXT *sysContext,
     TPM2_HANDLE handle1,
     TPM2_HANDLE handle2,
@@ -76,13 +77,13 @@ TpmCalcPHash(
     TPM2B_DIGEST *result);
 
 UINT32
-TpmHandleToName(
+tpm_handle_to_name(
     TSS2_TCTI_CONTEXT *tcti_context,
     TPM2_HANDLE handle,
     TPM2B_NAME *name);
 
 void
-RollNonces(
+roll_nonces(
     SESSION *session,
     TPM2B_NONCE *new_nonce);
 
@@ -98,7 +99,7 @@ KDFa(TPMI_ALG_HASH hash,
 SESSION *
 get_session(TPMI_SH_AUTH_SESSION hndl);
 
-TSS2_RC StartAuthSessionWithParams(
+TSS2_RC create_auth_session(
     SESSION **psession,
     TPMI_DH_OBJECT tpmKey,
     TPM2B_MAX_BUFFER *salt,
@@ -112,7 +113,7 @@ TSS2_RC StartAuthSessionWithParams(
     TSS2_TCTI_CONTEXT *tctiContext);
 
 TSS2_RC
-ComputeCommandHmacs(
+compute_command_hmac(
     TSS2_SYS_CONTEXT *sysContext,
     TPM2_HANDLE handle1,
     TPM2_HANDLE handle2,
@@ -120,7 +121,7 @@ ComputeCommandHmacs(
     TSS2L_SYS_AUTH_COMMAND *pSessionsDataIn);
 
 TSS2_RC
-CheckResponseHMACs(
+check_response_hmac(
     TSS2_SYS_CONTEXT *sysContext,
     TSS2L_SYS_AUTH_COMMAND *pSessionsDataIn,
     TPM2_HANDLE handle1,
@@ -129,7 +130,7 @@ CheckResponseHMACs(
     TSS2L_SYS_AUTH_RESPONSE *pSessionsDataOut);
 
 void
-EndAuthSession(SESSION *session);
+end_auth_session(SESSION *session);
 
 int
 AddEntity(TPM2_HANDLE handle, TPM2B_AUTH *auth);
@@ -144,14 +145,14 @@ ENTITY *
 GetEntity(TPM2_HANDLE handle);
 
 TSS2_RC
-EncryptCommandParam(
+encrypt_command_param(
     SESSION *session,
     TPM2B_MAX_BUFFER *encryptedData,
     TPM2B_MAX_BUFFER *clearData,
     TPM2B_AUTH *authValue);
 
 TSS2_RC
-DecryptResponseParam(
+decrypt_response_param(
     SESSION *session,
     TPM2B_MAX_BUFFER *clearData,
     TPM2B_MAX_BUFFER *encryptedData,

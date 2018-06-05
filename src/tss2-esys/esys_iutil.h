@@ -71,6 +71,13 @@ extern "C" {
         goto label;  \
     }
 
+#define goto_if_null(p,msg,ec,label) \
+    if ((p) == NULL) { \
+        LOG_ERROR("%s ", (msg)); \
+        r = (ec); \
+        goto label;  \
+    }
+
 #define goto_if_error(r,msg,label) \
     if (r != TSS2_RC_SUCCESS) { \
         LOG_ERROR("%s " TPM2_ERROR_FORMAT, msg, TPM2_ERROR_TEXT(r)); \
@@ -107,10 +114,11 @@ extern "C" {
         r_max = r; \
     }
 
-typedef    struct {
-    TPM2_ALG_ID alg;
-    size_t size;
-    uint8_t digest[sizeof(TPMU_HA)];
+/** An entry in a cpHash or rpHash table. */
+typedef struct {
+    TPM2_ALG_ID alg;                 /**< The hash algorithm. */
+    size_t size;                     /**< The digest size. */
+    uint8_t digest[sizeof(TPMU_HA)]; /**< The digest. */
 } HASH_TAB_ITEM;
 
 bool cmp_UINT16 (const UINT16 *in1, const UINT16 *in2);
@@ -142,7 +150,6 @@ TSS2_RC iesys_compute_cp_hashtab(
 
 TSS2_RC iesys_compute_rp_hashtab(
     ESYS_CONTEXT *esysContext,
-    TSS2L_SYS_AUTH_RESPONSE *rspAuths,
     const uint8_t *rpBuffer,
     size_t rpBuffer_size,
     HASH_TAB_ITEM rp_hash_tab[3],
@@ -164,13 +171,6 @@ TSS2_RC esys_GetResourceObject(
 
 TPM2_HT iesys_get_handle_type(
     TPM2_HANDLE handle);
-
-bool esys_flush_context(
-    TPM2_HANDLE handle);
-
-TSS2_RC iesys_get_nv_name(
-    TPMS_NV_PUBLIC *nvPublic,
-    TPM2B_NAME *name);
 
 TSS2_RC iesys_finalize(ESYS_CONTEXT *context);
 
@@ -199,12 +199,18 @@ TSS2_RC iesys_decrypt_param(
 TSS2_RC iesys_check_rp_hmacs(
     ESYS_CONTEXT *esysContext,
     TSS2L_SYS_AUTH_RESPONSE *rspAuths,
-    HASH_TAB_ITEM rp_hash_tab[3]);
+    HASH_TAB_ITEM rp_hash_tab[3],
+    uint8_t rpHashNum);
 
 void iesys_compute_bound_entity(
     const TPM2B_NAME *name,
     const TPM2B_AUTH *auth,
     TPM2B_NAME *bound_entity);
+
+bool iesys_is_object_bound(
+    const TPM2B_NAME * name,
+    const TPM2B_AUTH * auth,
+    RSRC_NODE_T * session);
 
 TSS2_RC iesys_check_sequence_async(
     ESYS_CONTEXT *esysContext);
@@ -220,7 +226,7 @@ void iesys_compute_session_value(
     const TPM2B_NAME *name,
     const TPM2B_AUTH *auth_value);
 
-TSS2_RC iesys_compute_hmacs(
+TSS2_RC iesys_compute_hmac(
     RSRC_NODE_T *session,
     HASH_TAB_ITEM cp_hash_tab[3],
     uint8_t cpHashNum,

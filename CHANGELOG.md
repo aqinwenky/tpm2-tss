@@ -4,17 +4,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 
 ## Unreleased
-### Added
+### Added/removed
+- Implementation of the Marshal/Unmarshal library (libtss2-mu)
+- Implementation of the Enhanced System API (libtss2-esys aka ESAPI)
+- New implemetation of the TPM Command Transmission Interface (TCTI) for:
+  - communication with Linux TPM2 device driver: libtss2-tcti-device
+  - communication with Microsoft software simulator: libtss2-tcti-mssim
+- New directory layout (API break)
+- Updated documentation with new doxygen and updated man pages
+- Support for Windows build with Visual Studio and clang, currently limited
+to libtss2-mu and libtss2-sys
+- Implementation of the new Attached Component (AC) commands
+- Implementation of the new TPM2_PolicyAuthorizeNV command
+- Implementation of the new TPM2_CreateLoaded command
+- Implementation of the new TPM2_PolicyTemplate command
+- Addition of _Complete functions to all TPM commands
+- New logging framework
 - Removed all sysapi/sysapi_utils/*arshal_TPM*.c files
-- Library for marshaling TPM2 types: libmarshal.
+- Added const qualifiers to API input pointers (API break)
+- Cleaned up headers and remove implementation.h and tpm2.h (API break)
+
 ### Changed
 - Converted all cpp files to c, removed dependency on C++ compiler.
-- Cleaned out a number of marshaling functions from the SAPI code. Things
-required by the resource manager were removed from libsapi and moved into
-the 'common directory.
+- Cleaned out a number of marshaling functions from the SAPI code.
 - Update Linux / Unix OS detection to use non-obsolete macros.
+- Changed TCTI macros to CamelCase (API break)
+- Changed TPMA_types to unsigned int with defines instead of bitfield structs (API/ABI break)
+- Changed Get/SetCmd/RspAuths to new parameter types (API/ABI break)
+- Fixed order of parameters in AC commands: Input command authorizations
+now come after the input handles, but still before the command parameters.
+
 ### Fixed
-- Wrong return type for Tss2_Sys_Finalize (API break).
+- Updated invalid number of handles in TPM2_PolicyNvWritten and TPM2_TestParms
+- Updated PlatformCommand function from libtss2-tcti-mssim to no longer send
+CANCEL_OFF before every command.
+- Expanded TPM2B macros and removed TPM2B_TYPE1 and TPM2B_TYPE2 macros
+- Fixed wrong return type for Tss2_Sys_Finalize (API break).
+
+## [1.4.0] - 2018-03-02
+### Added
+- Attached Component commands from the last public review spec.
+### Fixed
+- Essential files missing from release tarballs are now included.
+- Version string generation has been moved from configure.ac to the
+bootstrap script. It is now stored in a file named `VERSION` that is
+shipped in the release tarball.
+- We've stopped shipping the built man page for InitSocketTcti.3 and now
+ship the source.
 
 ## [1.3.0] - 2017-12-07
 ### Added
@@ -48,15 +84,6 @@ reproducible builds.
 - NULL dereference bugs in TCTI modules.
 - Cleanup & structure initialization to keep coverity scans happy.
 - Fixed memory leak in integration test harness.
-
-## [1.1.0] - 2017-05-10
-### Changed
-- tpmclient, disabled all tests that rely on the old resourcemgr.
-### Fixed
-- Fixed definition of PCR_LAST AND TRANSIENT_LAST macros.
-### Removed
-- tpmtest
-- resourcemgr, replacement is in new repo: https://github.com/01org/tpm2-abrmd
 
 ## [1.1.0] - 2017-05-10
 ### Changed

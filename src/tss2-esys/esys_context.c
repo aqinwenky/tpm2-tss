@@ -44,57 +44,50 @@
  *       Device /dev/tpmrm0 (kernel resident resource manager)
  *       Device /dev/tpm0 (hardware TPM)
  *       TCP socket localhost:2321 (TPM simulator)
- * @param esys_context [OUT] The ESYS_CONTEXT.
- * @param tcti [IN] The TCTI context used to connect to the TPM (may be NULL).
- * @param abiVersion [INOUT] The abi version to check and the abi version
+ * @param esys_context [out] The ESYS_CONTEXT.
+ * @param tcti [in] The TCTI context used to connect to the TPM (may be NULL).
+ * @param abiVersion [in,out] The abi version to check and the abi version
  *        supported by this implementation (may be NULL).
- * @retval TSS2_RC_SUCCESS on Success \todo Add error RCs.
+ * @retval TSS2_ESYS_RC_SUCCESS if the function call was a success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if esysContext is NULL.
+ * @retval TSS2_ESYS_RC_MEMORY if the ESAPI cannot allocate enough memory to
+ *         create the context.
+ * @retval TSS2_RCs produced by lower layers of the software stack may be
+ *         returned to the caller unaltered unless handled internally.
  */
 TSS2_RC
 Esys_Initialize(ESYS_CONTEXT ** esys_context, TSS2_TCTI_CONTEXT * tcti,
                 TSS2_ABI_VERSION * abiVersion)
 {
-    TSS2_RC rc;
+    TSS2_RC r;
     size_t syssize;
 
     _ESYS_ASSERT_NON_NULL(esys_context);
     *esys_context = NULL;
 
-    /* Allocate memory for the ESYS context; after that all errors must jump to
-       cleanup_return instead of returning ! */
+    /* Allocate memory for the ESYS context
+     * After this errors must jump to cleanup_return instead of returning. */
     *esys_context = calloc(1, sizeof(ESYS_CONTEXT));
-    if (esys_context == NULL) {
-        LOG_ERROR("Error: During malloc.");
-        return TSS2_ESYS_RC_MEMORY;
-    }
+    return_if_null(*esys_context, "Out of memory.", TSS2_ESYS_RC_MEMORY);
 
     /* Allocate memory for the SYS context */
     syssize = Tss2_Sys_GetContextSize(0);
-    (*esys_context)->sys = malloc(syssize);
-    if ((*esys_context)->sys == NULL) {
-        LOG_ERROR("Error: During malloc.");
-        rc = TSS2_ESYS_RC_MEMORY;
-        goto cleanup_return;
-    }
+    (*esys_context)->sys = calloc(1, syssize);
+    goto_if_null((*esys_context)->sys, "Error: During malloc.",
+                 TSS2_ESYS_RC_MEMORY, cleanup_return);
 
     /* Store the application provided tcti to be return on Esys_GetTcti(). */
     (*esys_context)->tcti_app_param = tcti;
 
     /* If no tcti was provided, initialize the default one. */
     if (tcti == NULL) {
-        rc = get_tcti_default(&tcti);
-        if (rc != TSS2_RC_SUCCESS) {
-            LOG_ERROR("Initialize default tcti (%x).", rc);
-            goto cleanup_return;
-        }
+        r = get_tcti_default(&tcti);
+        goto_if_error(r, "Initialize default tcti.", cleanup_return);
     }
 
     /* Initialize the ESAPI */
-    rc = Tss2_Sys_Initialize((*esys_context)->sys, syssize, tcti, abiVersion);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG_ERROR("Error: During syscontext initialization (%x).", rc);
-        goto cleanup_return;
-    }
+    r = Tss2_Sys_Initialize((*esys_context)->sys, syssize, tcti, abiVersion);
+    goto_if_error(r, "During syscontext initialization", cleanup_return);
 
     /* Use random number for initial esys handle value to provide pseudo
        namespace for handles */
@@ -113,7 +106,7 @@ cleanup_return:
     free((*esys_context)->sys);
     free(*esys_context);
     *esys_context = NULL;
-    return rc;
+    return r;
 }
 
 /** Finalize an ESYS_CONTEXT
@@ -121,12 +114,12 @@ cleanup_return:
  * After interactions with the TPM the context holding the metadata needs to be
  * freed. Since additional internal memory allocations may have happened during
  * use of the context, it needs to be finalized correctly.
- * @param esys_context [INOUT] The ESYS_CONTEXT. (will be freed and set to NULL)
+ * @param esys_context [in,out] The ESYS_CONTEXT. (will be freed and set to NULL)
  */
 void
 Esys_Finalize(ESYS_CONTEXT ** esys_context)
 {
-    TSS2_RC rc;
+    TSS2_RC r;
     TSS2_TCTI_CONTEXT *tctcontext = NULL;
 
     if (esys_context == NULL || *esys_context == NULL) {
@@ -137,13 +130,13 @@ Esys_Finalize(ESYS_CONTEXT ** esys_context)
     /* Flush from TPM and free all resource objects first */
     iesys_DeleteAllResourceObjects(*esys_context);
 
-    /* If no tcti context was provided during initialization, then wen need to
-       finalize the tcti context */
+    /* If no tcti context was provided during initialization, then we need to
+       finalize the tcti context. So we retrieve here before finalizing the
+       SAPI context. */
     if ((*esys_context)->tcti_app_param == NULL) {
-        rc = Tss2_Sys_GetTctiContext((*esys_context)->sys, &tctcontext);
-        if (rc != TSS2_RC_SUCCESS) {
-            LOG_WARNING("Internal error in SAPI.");
-        } else {
+        r = Tss2_Sys_GetTctiContext((*esys_context)->sys, &tctcontext);
+        if (r != TSS2_RC_SUCCESS) {
+            LOG_ERROR("Internal error in Tss2_Sys_GetTctiContext.");
             tctcontext = NULL;
         }
     }
@@ -152,8 +145,8 @@ Esys_Finalize(ESYS_CONTEXT ** esys_context)
     Tss2_Sys_Finalize((*esys_context)->sys);
     free((*esys_context)->sys);
 
-    /* If no tcti context was provided during initialization, then wen need to
-       finalize the tcti context */
+    /* If no tcti context was provided during initialization, then we need to
+       finalize the tcti context here. */
     if (tctcontext != NULL) {
         Tss2_Tcti_Finalize(tctcontext);
         free(tctcontext);
@@ -170,9 +163,10 @@ Esys_Finalize(ESYS_CONTEXT ** esys_context)
  * return. If NULL was passed in, then NULL will be returned.
  * This function is useful before Esys_Finalize to retrieve the tcti context and
  * perform a clean Tss2_Tcti_Finalize.
- * @param esys_context [IN] The ESYS_CONTEXT.
- * @param tcti [OUT] The TCTI context used to connect to the TPM (may be NULL).
- * @retval TSS2_RC_SUCCESS on Success \todo Add error RCs.
+ * @param esys_context [in] The ESYS_CONTEXT.
+ * @param tcti [out] The TCTI context used to connect to the TPM (may be NULL).
+ * @retval TSS2_RC_SUCCESS on Success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if esysContext or tcti is NULL.
  */
 TSS2_RC
 Esys_GetTcti(ESYS_CONTEXT * esys_context, TSS2_TCTI_CONTEXT ** tcti)
@@ -188,10 +182,12 @@ Esys_GetTcti(ESYS_CONTEXT * esys_context, TSS2_TCTI_CONTEXT ** tcti)
  * The connection to the TPM is held using a TCTI. These may optionally provide
  * handles that can be used to poll for incoming data. This is useful when
  * using the asynchronous function of ESAPI in an event-loop model.
- * @param esys_context [IN] The ESYS_CONTEXT.
- * @param handles [OUT] The poll handles (callee-allocated, use free())
- * @param count [OUT] The number of poll handles.
- * @retval TSS2_RC_SUCCESS on Success \todo Add error RCs.
+ * @param esys_context [in] The ESYS_CONTEXT.
+ * @param handles [out] The poll handles (callee-allocated, use free())
+ * @param count [out] The number of poll handles.
+ * @retval TSS2_RC_SUCCESS on Success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if esysContext, handles or count is NULL.
+ * @retval TSS2_RCs produced by lower layers of the software stack.
  */
 TSS2_RC
 Esys_GetPollHandles(ESYS_CONTEXT * esys_context,
@@ -206,19 +202,13 @@ Esys_GetPollHandles(ESYS_CONTEXT * esys_context,
 
     /* Get the tcti-context to use */
     r = Tss2_Sys_GetTctiContext(esys_context->sys, &tcti_context);
-    if (r != TSS2_RC_SUCCESS) {
-        LOG_ERROR("Invalid SAPI or TCTI context.");
-        return r;
-    }
+    return_if_error(r, "Invalid SAPI or TCTI context.");
 
     /* Allocate the memory to hold the poll handles */
     r = Tss2_Tcti_GetPollHandles(tcti_context, NULL, count);
     return_if_error(r, "Error getting poll handle count.");
-    *handles = malloc(sizeof(TSS2_TCTI_POLL_HANDLE) * (*count));
-    if (*handles == NULL) {
-        LOG_ERROR("Out of memory.");
-        return TSS2_ESYS_RC_MEMORY;
-    }
+    *handles = calloc(*count, sizeof(TSS2_TCTI_POLL_HANDLE));
+    return_if_null(*handles, "Out of memory.", TSS2_ESYS_RC_MEMORY);
 
     /* Retrieve the poll handles */
     r = Tss2_Tcti_GetPollHandles(tcti_context, *handles, count);
@@ -230,9 +220,10 @@ Esys_GetPollHandles(ESYS_CONTEXT * esys_context,
  *
  * Sets the timeout for the _finish() functions in the asynchronous versions of
  * the Esys commands.
- * @param esys_context [IN] The ESYS_CONTEXT.
- * @param timeout [IN] The timeout in ms or -1 to block indefinately.
- * @retval TSS2_RC_SUCCESS on Success \todo Add error RCs.
+ * @param esys_context [in] The ESYS_CONTEXT.
+ * @param timeout [in] The timeout in ms or -1 to block indefinately.
+ * @retval TSS2_RC_SUCCESS on Success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if esysContext is NULL.
  */
 TSS2_RC
 Esys_SetTimeout(ESYS_CONTEXT * esys_context, int32_t timeout)

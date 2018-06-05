@@ -1,5 +1,7 @@
-/*
- * Copyright (c) 2017, Intel Corporation
+/***********************************************************************
+ * Copyright (c) 2017-2018, Intel Corporation
+ *
+ * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -22,31 +24,64 @@
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
  * THE POSSIBILITY OF SUCH DAMAGE.
- */
-#include <inttypes.h>
-
-#define LOGMODULE test
-#include "util/log.h"
+ ***********************************************************************/
+#include "tss2_tpm2_types.h"
+#include "sysapi_util.h"
 #include "sapi-util.h"
-#include "test.h"
+#include "session-util.h"
+
+static ENTITY *entities = NULL;
 
 int
-test_invoke (TSS2_SYS_CONTEXT *sapi_context)
+AddEntity(TPM2_HANDLE handle, TPM2B_AUTH *auth)
 {
-    TSS2_RC rc;
-    TPM2_HANDLE handle;
+    ENTITY *e;
 
-    rc = create_primary_rsa_2048_aes_128_cfb (sapi_context, &handle);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG_ERROR("CreatePrimary failed with 0x%"PRIx32, rc);
-        return 1;
+    HASH_FIND_INT(entities, &handle, e);
+
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        if (!e)
+            return -1;
+
+        e->entityHandle = handle;
+        HASH_ADD_INT(entities, entityHandle, e);
     }
-
-    rc = Tss2_Sys_FlushContext(sapi_context, handle);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG_ERROR("Tss2_Sys_FlushContext failed with 0x%"PRIx32, rc);
-        return 99; /* fatal error */
-    }
-
+    CopySizedByteBuffer((TPM2B *)&e->entityAuth, (TPM2B *)auth);
     return 0;
+}
+
+void
+DeleteEntity(TPM2_HANDLE handle)
+{
+    ENTITY *e;
+
+    HASH_FIND_INT(entities, &handle, e);
+    if (!e)
+        return;
+
+    HASH_DEL(entities, e);
+    free(e);
+}
+
+int
+GetEntityAuth(TPM2_HANDLE handle, TPM2B_AUTH *auth)
+{
+    ENTITY *e;
+
+    HASH_FIND_INT(entities, &handle, e);
+    if (!e)
+        return -1;
+
+    CopySizedByteBuffer((TPM2B *)auth, (TPM2B *)&e->entityAuth);
+    return 0;
+}
+
+ENTITY *
+GetEntity(TPM2_HANDLE handle)
+{
+    ENTITY *e;
+
+    HASH_FIND_INT(entities, &handle, e);
+    return e;
 }

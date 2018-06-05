@@ -182,12 +182,6 @@ Esys_TRSess_SetAttributes(
     TPMA_SESSION mask);
 
 TSS2_RC
-Esys_TRSess_SetSessionKey(
-    ESYS_CONTEXT *esysContext,
-    ESYS_TR session,
-    TPM2B_AUTH const *key);
-
-TSS2_RC
 Esys_TRSess_GetNonceTPM(
     ESYS_CONTEXT *esysContext,
     ESYS_TR session,
@@ -315,8 +309,7 @@ Esys_StartAuthSession(
     TPM2_SE sessionType,
     const TPMT_SYM_DEF *symmetric,
     TPMI_ALG_HASH authHash,
-    ESYS_TR *sessionHandle,
-    TPM2B_NONCE **nonceTPM);
+    ESYS_TR *sessionHandle);
 
 TSS2_RC
 Esys_StartAuthSession_Async(
@@ -334,8 +327,7 @@ Esys_StartAuthSession_Async(
 TSS2_RC
 Esys_StartAuthSession_Finish(
     ESYS_CONTEXT *esysContext,
-    ESYS_TR *sessionHandle,
-    TPM2B_NONCE **nonceTPM);
+    ESYS_TR *sessionHandle);
 
 /* Table 17 - TPM2_PolicyRestart Command */
 
@@ -1898,19 +1890,19 @@ Esys_PolicyPCR_Finish(
 TSS2_RC
 Esys_PolicyLocality(
     ESYS_CONTEXT *esysContext,
+    ESYS_TR policySession,
     ESYS_TR shandle1,
     ESYS_TR shandle2,
     ESYS_TR shandle3,
-    TPMI_SH_POLICY policySession,
     TPMA_LOCALITY locality);
 
 TSS2_RC
 Esys_PolicyLocality_Async(
     ESYS_CONTEXT *esysContext,
+    ESYS_TR policySession,
     ESYS_TR shandle1,
     ESYS_TR shandle2,
     ESYS_TR shandle3,
-    TPMI_SH_POLICY policySession,
     TPMA_LOCALITY locality);
 
 TSS2_RC

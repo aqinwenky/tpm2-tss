@@ -73,24 +73,39 @@ static void store_input_parameters (
  * parameters is allocated by the function implementation.
  *
  * @param[in,out] esysContext The ESYS_CONTEXT.
- * @param[in] tpmKey Input handle of type ESYS_TR for
- *     object with handle type TPMI_DH_OBJECT.
- * @param[in] bind Input handle of type ESYS_TR for
- *     object with handle type TPMI_DH_ENTITY.
- * @param[in] shandle1 First session handle.
- * @param[in] shandle2 Second session handle.
- * @param[in] shandle3 Third session handle.
- * @param[in] nonceCaller Input parameter of type TPM2B_NONCE.
- * @param[in] encryptedSalt Input parameter of type TPM2B_ENCRYPTED_SECRET.
- * @param[in] sessionType Input parameter of type TPM2_SE.
- * @param[in] symmetric Input parameter of type TPMT_SYM_DEF.
- * @param[in] authHash Input parameter of type TPMI_ALG_HASH.
- * @param[out] nonceTPM (callee-allocated) Output parameter
- *    of type TPM2B_NONCE. May be NULL if this value is not required.
+ * @param[in]  tpmKey Handle of a loaded decrypt key used to encrypt salt.
+ * @param[in]  bind Entity providing the authValue.
+ * @param[in]  shandle1 First session handle.
+ * @param[in]  shandle2 Second session handle.
+ * @param[in]  shandle3 Third session handle.
+ * @param[in]  nonceCaller Initial nonceCaller, sets nonceTPM size for the session.
+ * @param[in]  encryptedSalt Value encrypted according to the type of tpmKey.
+ * @param[in]  sessionType Indicates the type of the session; simple HMAC or
+ *             policy (including a trial policy).
+ * @param[in]  symmetric The algorithm and key size for parameter encryption.
+ * @param[in]  authHash Hash algorithm to use for the session.
  * @param[out] sessionHandle  ESYS_TR handle of ESYS resource for TPMI_SH_AUTH_SESSION.
  * @retval TSS2_RC_SUCCESS on success
- * @retval TSS2_RC_BAD_SEQUENCE if context is not ready for this function
- * \todo add further error RCs to documentation
+ * @retval ESYS_RC_SUCCESS if the function call was a success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if the esysContext or required input
+ *         pointers or required output handle references are NULL.
+ * @retval TSS2_ESYS_RC_BAD_CONTEXT: if esysContext corruption is detected.
+ * @retval TSS2_ESYS_RC_MEMORY: if the ESAPI cannot allocate enough memory for
+ *         internal operations or return parameters.
+ * @retval TSS2_ESYS_RC_BAD_SEQUENCE: if the context has an asynchronous
+ *         operation already pending.
+ * @retval TSS2_ESYS_RC_INSUFFICIENT_RESPONSE: if the TPM's response does not
+ *          at least contain the tag, response length, and response code.
+ * @retval TSS2_ESYS_RC_MALFORMED_RESPONSE: if the TPM's response is corrupted.
+ * @retval TSS2_ESYS_RC_MULTIPLE_DECRYPT_SESSIONS: if more than one session has
+ *         the 'decrypt' attribute bit set.
+ * @retval TSS2_ESYS_RC_MULTIPLE_ENCRYPT_SESSIONS: if more than one session has
+ *         the 'encrypt' attribute bit set.
+ * @retval TSS2_ESYS_RC_BAD_TR: if any of the ESYS_TR objects are unknown to the
+ *         ESYS_CONTEXT or are of the wrong type or if required ESYS_TR objects
+ *         are ESYS_TR_NONE.
+ * @retval TSS2_RCs produced by lower layers of the software stack may be
+ *         returned to the caller unaltered unless handled internally.
  */
 TSS2_RC
 Esys_StartAuthSession(
@@ -104,8 +119,7 @@ Esys_StartAuthSession(
     TPM2_SE sessionType,
     const TPMT_SYM_DEF *symmetric,
     TPMI_ALG_HASH authHash,
-    ESYS_TR *sessionHandle,
-    TPM2B_NONCE **nonceTPM)
+    ESYS_TR *sessionHandle)
 {
     TSS2_RC r;
 
@@ -133,8 +147,7 @@ Esys_StartAuthSession(
      */
     do {
         r = Esys_StartAuthSession_Finish(esysContext,
-                sessionHandle,
-                nonceTPM);
+                sessionHandle);
         /* This is just debug information about the reattempt to finish the
            command */
         if ((r & ~TSS2_RC_LAYER_MASK) == TSS2_BASE_RC_TRY_AGAIN)
@@ -157,21 +170,32 @@ Esys_StartAuthSession(
  * In order to retrieve the TPM's response call Esys_StartAuthSession_Finish.
  *
  * @param[in,out] esysContext The ESYS_CONTEXT.
- * @param[in] tpmKey Input handle of type ESYS_TR for
- *     object with handle type TPMI_DH_OBJECT.
- * @param[in] bind Input handle of type ESYS_TR for
- *     object with handle type TPMI_DH_ENTITY.
- * @param[in] shandle1 First session handle.
- * @param[in] shandle2 Second session handle.
- * @param[in] shandle3 Third session handle.
- * @param[in] nonceCaller Input parameter of type TPM2B_NONCE.
- * @param[in] encryptedSalt Input parameter of type TPM2B_ENCRYPTED_SECRET.
- * @param[in] sessionType Input parameter of type TPM2_SE.
- * @param[in] symmetric Input parameter of type TPMT_SYM_DEF.
- * @param[in] authHash Input parameter of type TPMI_ALG_HASH.
- * @retval TSS2_RC_SUCCESS on success
- * @retval TSS2_RC_BAD_SEQUENCE if context is not ready for this function
- * \todo add further error RCs to documentation
+ * @param[in]  tpmKey Handle of a loaded decrypt key used to encrypt salt.
+ * @param[in]  bind Entity providing the authValue.
+ * @param[in]  shandle1 First session handle.
+ * @param[in]  shandle2 Second session handle.
+ * @param[in]  shandle3 Third session handle.
+ * @param[in]  nonceCaller Initial nonceCaller, sets nonceTPM size for the session.
+ * @param[in]  encryptedSalt Value encrypted according to the type of tpmKey.
+ * @param[in]  sessionType Indicates the type of the session; simple HMAC or
+ *             policy (including a trial policy).
+ * @param[in]  symmetric The algorithm and key size for parameter encryption.
+ * @param[in]  authHash Hash algorithm to use for the session.
+ * @retval ESYS_RC_SUCCESS if the function call was a success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if the esysContext or required input
+ *         pointers or required output handle references are NULL.
+ * @retval TSS2_ESYS_RC_BAD_CONTEXT: if esysContext corruption is detected.
+ * @retval TSS2_ESYS_RC_MEMORY: if the ESAPI cannot allocate enough memory for
+ *         internal operations or return parameters.
+ * @retval TSS2_RCs produced by lower layers of the software stack may be
+           returned to the caller unaltered unless handled internally.
+ * @retval TSS2_ESYS_RC_MULTIPLE_DECRYPT_SESSIONS: if more than one session has
+ *         the 'decrypt' attribute bit set.
+ * @retval TSS2_ESYS_RC_MULTIPLE_ENCRYPT_SESSIONS: if more than one session has
+ *         the 'encrypt' attribute bit set.
+ * @retval TSS2_ESYS_RC_BAD_TR: if any of the ESYS_TR objects are unknown to the
+           ESYS_CONTEXT or are of the wrong type or if required ESYS_TR objects
+           are ESYS_TR_NONE.
  */
 TSS2_RC
 Esys_StartAuthSession_Async(
@@ -289,23 +313,33 @@ Esys_StartAuthSession_Async(
  * output parameter if the value is not required.
  *
  * @param[in,out] esysContext The ESYS_CONTEXT.
- * @param[out] nonceTPM (callee-allocated) Output parameter
- *    of type TPM2B_NONCE. May be NULL if this value is not required.
  * @param[out] sessionHandle  ESYS_TR handle of ESYS resource for TPMI_SH_AUTH_SESSION.
  * @retval TSS2_RC_SUCCESS on success
- * @retval TSS2_RC_BAD_SEQUENCE if context is not ready for this function.
- * \todo add further error RCs to documentation
+ * @retval ESYS_RC_SUCCESS if the function call was a success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE if the esysContext or required input
+ *         pointers or required output handle references are NULL.
+ * @retval TSS2_ESYS_RC_BAD_CONTEXT: if esysContext corruption is detected.
+ * @retval TSS2_ESYS_RC_MEMORY: if the ESAPI cannot allocate enough memory for
+ *         internal operations or return parameters.
+ * @retval TSS2_ESYS_RC_BAD_SEQUENCE: if the context has an asynchronous
+ *         operation already pending.
+ * @retval TSS2_ESYS_RC_TRY_AGAIN: if the timeout counter expires before the
+ *         TPM response is received.
+ * @retval TSS2_ESYS_RC_INSUFFICIENT_RESPONSE: if the TPM's response does not
+ *          at least contain the tag, response length, and response code.
+ * @retval TSS2_ESYS_RC_MALFORMED_RESPONSE: if the TPM's response is corrupted.
+ * @retval TSS2_RCs produced by lower layers of the software stack may be
+ *         returned to the caller unaltered unless handled internally.
  */
 TSS2_RC
 Esys_StartAuthSession_Finish(
     ESYS_CONTEXT *esysContext,
-    ESYS_TR *sessionHandle,
-    TPM2B_NONCE **nonceTPM)
+    ESYS_TR *sessionHandle)
 {
-    TPM2B_NONCE *lnonceTPM = NULL;
+    TPM2B_NONCE lnonceTPM;
     TSS2_RC r;
-    LOG_TRACE("context=%p, sessionHandle=%p, nonceTPM=%p",
-              esysContext, sessionHandle, nonceTPM);
+    LOG_TRACE("context=%p, sessionHandle=%p",
+              esysContext, sessionHandle);
 
     if (esysContext == NULL) {
         LOG_ERROR("esyscontext is NULL.");
@@ -320,7 +354,6 @@ Esys_StartAuthSession_Finish(
     esysContext->state = _ESYS_STATE_INTERNALERROR;
     RSRC_NODE_T *sessionHandleNode = NULL;
 
-
     /* Allocate memory for response parameters */
     if (sessionHandle == NULL) {
         LOG_ERROR("Handle sessionHandle may not be NULL");
@@ -331,10 +364,6 @@ Esys_StartAuthSession_Finish(
     if (r != TSS2_RC_SUCCESS)
         return r;
 
-    lnonceTPM = calloc(sizeof(TPM2B_NONCE), 1);
-    if (lnonceTPM == NULL) {
-        goto_error(r, TSS2_ESYS_RC_MEMORY, "Out of memory", error_cleanup);
-    }
     IESYS_RESOURCE *rsrc = &sessionHandleNode->rsrc;
     rsrc->misc.rsrc_session.sessionAttributes =
         TPMA_SESSION_CONTINUESESSION;
@@ -409,11 +438,11 @@ Esys_StartAuthSession_Finish(
      */
     r = Tss2_Sys_StartAuthSession_Complete(esysContext->sys,
                 &sessionHandleNode->rsrc.handle,
-                lnonceTPM);
+                &lnonceTPM);
     goto_state_if_error(r, _ESYS_STATE_INTERNALERROR, "Received error from SAPI"
                         " unmarshaling" ,error_cleanup);
 
-    sessionHandleNode->rsrc.misc.rsrc_session.nonceTPM = *lnonceTPM;
+    sessionHandleNode->rsrc.misc.rsrc_session.nonceTPM = lnonceTPM;
     sessionHandleNode->rsrc.rsrcType = IESYSC_SESSION_RSRC;
     if (esysContext->in.StartAuthSession.bind != ESYS_TR_NONE || esysContext->salt.size > 0) {
         ESYS_TR bind = esysContext->in.StartAuthSession.bind;
@@ -472,7 +501,7 @@ Esys_StartAuthSession_Finish(
         LOGBLOB_DEBUG(secret, secret_size, "ESYS Session Secret");
         r = iesys_crypto_KDFa(esysContext->in.StartAuthSession.authHash, secret,
                               secret_size, "ATH",
-                               lnonceTPM, esysContext->in.StartAuthSession.nonceCaller,
+                               &lnonceTPM, esysContext->in.StartAuthSession.nonceCaller,
                                authHash_size*8, NULL,
                      &sessionHandleNode->rsrc.misc.rsrc_session.sessionKey.buffer[0], FALSE);
         free(secret);
@@ -487,18 +516,12 @@ Esys_StartAuthSession_Finish(
 
         sessionHandleNode->rsrc.misc.rsrc_session.sessionKey.size = authHash_size;
     }
-    if (nonceTPM != NULL)
-        *nonceTPM = lnonceTPM;
-    else
-        SAFE_FREE(lnonceTPM);
-
     esysContext->state = _ESYS_STATE_INIT;
 
     return TSS2_RC_SUCCESS;
 
 error_cleanup:
     Esys_TR_Close(esysContext, sessionHandle);
-    SAFE_FREE(lnonceTPM);
 
     return r;
 }

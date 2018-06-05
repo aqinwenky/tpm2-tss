@@ -15,12 +15,14 @@ following sections describe them for the supported platforms.
 * pkg-config
 * uriparser development libraries and header files
 * libgcrypt development libraries and header files
+* uthash development libraries and header files
 
 The following are dependencies only required when building test suites.
-* Integration test suite (see ./configure option --with-simulatorbin):
+* Integration test suite (see ./configure option --enable-integration):
 * OpenSSL development libraries and header files
 * Unit test suite (see ./configure option --enable-unit):
 * cmocka unit test framework, version >= 1.0
+* netstat executable (usually in the net-tools package)
 * Code coverage analysis:
 * lcov
 * autoconf-archives
@@ -35,6 +37,7 @@ $ sudo apt -y install \
   autoconf-archive \
   libcmocka0 \
   libcmocka-dev \
+  net-tools \
   build-essential \
   git \
   pkg-config \
@@ -43,9 +46,9 @@ $ sudo apt -y install \
   m4 \
   libtool \
   automake \
-  liburiparser-dev \
   libgcrypt20-dev \
   libssl-dev \
+  uthash-dev \
   autoconf
 ```
 Note: In some Ubuntu versions, the lcov and autoconf-archive packages are incompatible with each other. Recommend downloading autoconf-archives directly from upstream and copy ax_code_coverage.m4.

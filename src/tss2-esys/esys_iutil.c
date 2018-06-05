@@ -35,7 +35,7 @@
 #include "util/log.h"
 
 /**
- * Compare variables of type  UINT16.
+ * Compare variables of type UINT16.
  * @param[in] in1 Variable to be compared with:
  * @param[in] in2
  */
@@ -52,7 +52,7 @@ cmp_UINT16(const UINT16 * in1, const UINT16 * in2)
 }
 
 /**
- * Compare variables of type  BYTE.
+ * Compare variables of type BYTE.
  * @param[in] in1 Variable to be compared with:
  * @param[in] in2
  */
@@ -163,6 +163,11 @@ init_session_tab(ESYS_CONTEXT *esys_context,
     return r;
 }
 
+/** Delete all resource objects stored in the esys context.
+ *
+ * All resource objects stored in a linked list of the esys context are deleted.
+ * @param[in,out] esys_context The ESYS_CONTEXT
+ */
 void
 iesys_DeleteAllResourceObjects(ESYS_CONTEXT * esys_context)
 {
@@ -174,7 +179,17 @@ iesys_DeleteAllResourceObjects(ESYS_CONTEXT * esys_context)
         SAFE_FREE(node_rsrc);
     }
 }
-
+/**  Compute the TPM nonce of the session used for parameter encryption.
+ *
+ * Since only encryption session can be used an error is signaled if
+ * more encryption sessions are used.
+ * @param[in] esys_context The ESYS_CONTEXT
+ * @param[out] encryptNonceIndex The number of the session used for encryption.
+ * @param[out] encryptNonce The nonce used for encryption by TPM.
+ * @retval TSS2_RC_SUCCESS on Success.
+ * @retval TSS2_ESYS_RC_MULTIPLE_ENCRYPT_SESSIONS if more than one encrypt
+ *         session is used.
+ */
 TSS2_RC
 iesys_compute_encrypt_nonce(ESYS_CONTEXT * esys_context,
                             int *encryptNonceIdx, TPM2B_NONCE ** encryptNonce)
@@ -185,7 +200,8 @@ iesys_compute_encrypt_nonce(ESYS_CONTEXT * esys_context,
             if (session->rsrc.misc.rsrc_session.
                 sessionAttributes & TPMA_SESSION_ENCRYPT) {
                 if (*encryptNonce != NULL) {
-                    return_error(TSS2_ESYS_RC_MULTIPLE_ENCRYPT_SESSIONS,
+		    /* Encrypt nonce already found */
+		    return_error(TSS2_ESYS_RC_MULTIPLE_ENCRYPT_SESSIONS,
                                  "More than one encrypt session");
                 }
                 *encryptNonceIdx = i;
@@ -196,6 +212,28 @@ iesys_compute_encrypt_nonce(ESYS_CONTEXT * esys_context,
     return TSS2_RC_SUCCESS;
 }
 
+/** Computation of the command parameter(cp) hashes.
+ *
+ * The command parameter(cp) hash of the command is computed for every
+ * session.  If the sessions use different hash algorithms then different cp
+ * hashes must be calculated.
+ * The names of objects with an auth index and the command buffer are used
+ * to compute the cp hash with the hash algorithm of the corresponding session.
+ * The result is stored in table together with the used hash algorithm.
+ * @param[in] esys_context The ESYS_CONTEXT
+ * @param[in] name1 The name of the first object with an auth index.
+ * @param[in] name2 The name of the second object with an auth index.
+ * @param[in] name3 The name of the third object with an auth index.
+ * @param[3] [out] cp_hash_tab An array with all cp hashes.
+ *        The used hash algorithm is stored in this table to find the
+ *        appropriate values for a session.
+ * @param[out] cpHashNum Number of computed cp hash values. This value
+ *        corresponds to the number of used hash algorithms.
+ * @retval TSS2_RC_SUCCESS on success,
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for invalid parameters.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if a hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_compute_cp_hashtab(ESYS_CONTEXT * esys_context,
                          const TPM2B_NAME * name1,
@@ -243,9 +281,29 @@ iesys_compute_cp_hashtab(ESYS_CONTEXT * esys_context,
     return r;
 }
 
+/** Computation of the response parameter (rp) hashes.
+ * The response parameter (rp) hash of the response is computed for every
+ * session.  If the sessions use different hash algorithms then different rp
+ * hashes must be calculated.
+ * The names of objects with an auth index and the command buffer are used
+ * to compute the cp hash with the hash algorithm of the corresponding session.
+ * The result is stored in table together with the used hash algorithm.
+ * @param[in] esys_context The ESYS_CONTEXT
+ * @param[in] rspAuths List of response
+ * @param[in] const uint8_t * rpBuffer The pointer to the response buffer
+ * @param[in] size_t rpBuffer_size The size of the response.
+ * @param[out] HASH_TAB_ITEM rp_hash_tab[3] An array with all rp hashes.
+ *        The used hash algorithm is stored in this table to find the
+ *        appropriate values for a session.
+ * @param[out] uint8_t Number of computed rp hash values. This value
+ *        corresponds to the number of used hash algorithms.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for invalid parameters.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if a hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_compute_rp_hashtab(ESYS_CONTEXT * esys_context,
-                         TSS2L_SYS_AUTH_RESPONSE * rspAuths,
                          const uint8_t * rpBuffer,
                          size_t rpBuffer_size,
                          HASH_TAB_ITEM rp_hash_tab[3], uint8_t * rpHashNum)
@@ -255,16 +313,19 @@ iesys_compute_rp_hashtab(ESYS_CONTEXT * esys_context,
     TSS2_RC r = Tss2_Sys_GetCommandCode(esys_context->sys, &ccBuffer[0]);
     return_if_error(r, "Error: get command code");
 
-    for (int i = 0; i < rspAuths->count; i++) {
+    for (int i = 0; i < esys_context->authsCount; i++) {
         RSRC_NODE_T *session = esys_context->session_tab[i];
         if (session == NULL)
             continue;
         bool rpHashFound = false;
+        /* We do not want to compute cpHashes multiple times for the same
+           algorithm to save time and space */
         for (int j = 0; j < *rpHashNum; j++)
             if (rp_hash_tab[j].alg == session->rsrc.misc.rsrc_session.authHash) {
                 rpHashFound = true;
                 break;
             }
+        /* If not, we compute it and append it to the list */
         if (!rpHashFound) {
             rp_hash_tab[*rpHashNum].size = sizeof(TPMU_HA);
             r = iesys_crypto_rpHash(session->rsrc.misc.rsrc_session.authHash,
@@ -279,7 +340,16 @@ iesys_compute_rp_hashtab(ESYS_CONTEXT * esys_context,
     }
     return TPM2_RC_SUCCESS;
 }
-
+/** Create an esys resource object corresponding to a TPM object.
+ *
+ * The esys object is appended to the resource list stored in the esys context
+ * (rsrc_list).
+ * @param[in] esys_context The ESYS_CONTEXT
+ * @param[in] esys_handle The esys handle which will be used for this object.
+ * @param[out] esys_object The new resource object.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY if the object can not be allocated.
+ */
 TSS2_RC
 esys_CreateResourceObject(ESYS_CONTEXT * esys_context,
                           ESYS_TR esys_handle, RSRC_NODE_T ** esys_object)
@@ -288,9 +358,11 @@ esys_CreateResourceObject(ESYS_CONTEXT * esys_context,
     if (new_esys_object == NULL)
         return_error(TSS2_ESYS_RC_MEMORY, "Out of memory.");
     if (esys_context->rsrc_list == NULL) {
+        /* The first object of the list will be added */
         esys_context->rsrc_list = new_esys_object;
         new_esys_object->next = NULL;
     } else {
+        /* The new object will become the first element of the list */
         new_esys_object->next = esys_context->rsrc_list;
         esys_context->rsrc_list = new_esys_object;
     }
@@ -299,6 +371,15 @@ esys_CreateResourceObject(ESYS_CONTEXT * esys_context,
     return TSS2_RC_SUCCESS;
 }
 
+/** Compute tpm handle for standard esys handles.
+ *
+ * The tpm handle ist computed for esys handles representing pcr registers and
+ * hierarchies.
+ * @parm esys_handle [in] The esys handle.
+ * @parm tpm_handle [out] The corresponding tpm handle.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_BAD_VALUE if no standard handle is passed.
+ */
 TSS2_RC
 iesys_handle_to_tpm_handle(ESYS_TR esys_handle, TPM2_HANDLE * tpm_handle)
 {
@@ -334,7 +415,11 @@ iesys_handle_to_tpm_handle(ESYS_TR esys_handle, TPM2_HANDLE * tpm_handle)
     LOG_ERROR("Error: Esys invalid ESAPI handle (%x).", esys_handle);
     return TSS2_ESYS_RC_BAD_VALUE;
 }
-
+/** Get the type of a tpm handle.
+ *
+ * @parm handle[in] The tpm handle.
+ * @retval The part of the handle which represents the handle type.
+ */
 TPM2_HT
 iesys_get_handle_type(TPM2_HANDLE handle)
 {
@@ -342,45 +427,14 @@ iesys_get_handle_type(TPM2_HANDLE handle)
     return ht;
 }
 
-bool
-esys_flush_context(TPM2_HANDLE handle)
-{
-    TPM2_HT ht = iesys_get_handle_type(handle);
-    switch (ht) {
-    case TPM2_HT_TRANSIENT:
-            return true;
-    default:
-            return false;
-    }
-}
-
-TSS2_RC
-iesys_get_nv_name(TPMS_NV_PUBLIC * nvPublic, TPM2B_NAME * name)
-{
-    BYTE buffer[sizeof(TPMS_NV_PUBLIC)];
-    size_t max_size_hash = sizeof(TPMU_HA);
-    IESYS_CRYPTO_CONTEXT_BLOB *cryptoContext;
-    size_t offset = 0;
-    TSS2_RC r = Tss2_MU_TPMS_NV_PUBLIC_Marshal(nvPublic,
-                                               buffer,
-                                               sizeof(TPMS_NV_PUBLIC),
-                                               &offset);
-    return_if_error(r, "Error: During nv public marshal");
-
-    r = iesys_crypto_hash_start(&cryptoContext, nvPublic->nameAlg);
-    return_if_error(r, "Error: During hash start");
-
-    r = iesys_crypto_hash_update(cryptoContext, &buffer[0], offset);
-    return_if_error(r, "Error: During hash update");
-
-    r = iesys_crypto_hash_finish(&cryptoContext, &name->name[2],
-                                 &max_size_hash);
-    return_if_error(r, "Error: During hash finish");
-
-    name->size = (UINT16) offset + 2;
-    return TSS2_RC_SUCCESS;
-}
-
+/** Compute name derived from public info with a tpm name.
+ *
+ * A tpm name is computed from a public info structure and compared with a
+ * second tpm name.
+ * @param[in]  publicInfo The public info for name computation.
+ * @param[in] name The name used for comparison.
+ * @retval bool indicates whether the names are equal.
+ */
 bool
 iesys_compare_name(TPM2B_PUBLIC * publicInfo, TPM2B_NAME * name)
 {
@@ -396,6 +450,28 @@ iesys_compare_name(TPM2B_PUBLIC * publicInfo, TPM2B_NAME * name)
     return cmp_TPM2B_NAME(&public_info_name, name);
 }
 
+/** Compute a random salt which will be used for parameter encryption.
+ *
+ * Depending in the type of TPM key used for key exchange a salt will be computed.
+ * For an ECC key an ephemeral key will be computed. This key together with the
+ * public point of the TPMs key will be used to compute a shared secret which will
+ * be used for the key derivation of the key for parameter encryption.
+ * For an RSA key a random number will be computed to derive this key. The random
+ * number will be encrypted with the TPM key.
+ * @param[in,out]  esys_context The ESYS_CONTEXT. The generated salt will be
+ *                 stored in this context.
+ * @param[in] tpmKeyNode The esys resource object of the TPM key which will be
+ *            used for key exchange.
+ * @param[out] encryptedSalt In the case of an ECC the public point of the
+ *             ephemeral key will be marshaled into this buffer.
+ *             In the case of a TPM key the encrypted salt will be stored.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_compute_encrypted_salt(ESYS_CONTEXT * esys_context,
                              RSRC_NODE_T * tpmKeyNode,
@@ -404,20 +480,32 @@ iesys_compute_encrypted_salt(ESYS_CONTEXT * esys_context,
     TSS2_RC r = TSS2_RC_SUCCESS;
     size_t keyHash_size = 0;
     size_t cSize = 0;
-    if (tpmKeyNode != NULL) {
-        if (tpmKeyNode->rsrc.rsrcType != IESYSC_KEY_RSRC) {
-            LOG_TRACE("Public info needed.");
-            return TSS2_ESYS_RC_BAD_VALUE;
-        }
-        r = iesys_crypto_hash_get_digest_size(tpmKeyNode->rsrc.misc.
-                                              rsrc_key_pub.publicArea.nameAlg,
-                                              &keyHash_size);
-        return_if_error(r, "Hash algorithm not supported.");
-        iesys_crypto_random2b((TPM2B_NONCE *) & esys_context->salt, keyHash_size);
+    TPM2B_ECC_PARAMETER Z; /* X coordinate of privKey*publicKey */
+    TPMS_ECC_POINT Q; /* Public point of ephemeral key */
+
+    if (tpmKeyNode == 0) {
+        encryptedSalt->size = 0;
+        return TSS2_RC_SUCCESS;
+    }
+
+    TPM2B_PUBLIC pub = tpmKeyNode->rsrc.misc.rsrc_key_pub;
+    if (tpmKeyNode->rsrc.rsrcType != IESYSC_KEY_RSRC) {
+        LOG_TRACE("Public info needed.");
+        return TSS2_ESYS_RC_BAD_VALUE;
+    }
+    r = iesys_crypto_hash_get_digest_size(tpmKeyNode->rsrc.misc.
+                                          rsrc_key_pub.publicArea.nameAlg,
+                                          &keyHash_size);
+    return_if_error(r, "Hash algorithm not supported.");
+
+    switch (pub.publicArea.type) {
+    case TPM2_ALG_RSA:
+
+        iesys_crypto_random2b((TPM2B_NONCE *) & esys_context->salt,
+                              keyHash_size);
 
         /* When encrypting salts, the encryption scheme of a key is ignored and
            TPM2_ALG_OAEP is always used. */
-        TPM2B_PUBLIC pub = tpmKeyNode->rsrc.misc.rsrc_key_pub;
         pub.publicArea.parameters.rsaDetail.scheme.scheme = TPM2_ALG_OAEP;
         r = iesys_crypto_pk_encrypt(&pub,
                                     keyHash_size, &esys_context->salt.buffer[0],
@@ -427,12 +515,42 @@ iesys_compute_encrypted_salt(ESYS_CONTEXT * esys_context,
         return_if_error(r, "During encryption.");
         LOGBLOB_DEBUG(&encryptedSalt->secret[0], cSize, "IESYS encrypted salt");
         encryptedSalt->size = cSize;
-    } else {
-        encryptedSalt->size = 0;
+        break;
+    case TPM2_ALG_ECC:
+        r = iesys_crypto_get_ecdh_point(&pub, sizeof(TPMU_ENCRYPTED_SECRET),
+                                        &Z, &Q,
+                                        (BYTE *) &encryptedSalt->secret[0],
+                                        &cSize);
+        return_if_error(r, "During computation of ECC public key.");
+        encryptedSalt->size = cSize;
+
+        /* Compute salt from Z with KDFe */
+        r = iesys_cryptogcry_KDFe(tpmKeyNode->rsrc.misc.
+                                  rsrc_key_pub.publicArea.nameAlg,
+                                  &Z, "SECRET", &Q.x,
+                                  &pub.publicArea.unique.ecc.x,
+                                  keyHash_size*8,
+                                  &esys_context->salt.buffer[0]);
+        return_if_error(r, "During KDFe computation.");
+        esys_context->salt.size = keyHash_size;
+        break;
+    default:
+        LOG_ERROR("Not implemented");
+        return TSS2_ESYS_RC_GENERAL_FAILURE;
+        break;
     }
     return r;
 }
 
+/** Generate caller nonces for all sessions.
+ *
+ * For every uses session stored in context random nonce is computed.
+ * @param[in,out]  esys_context The ESYS_CONTEXT. The generated nonces will be
+ *                 stored in this context.
+ * @retval TPM2_RC_SUCCESS on success. An possible error is:
+ * @retval TSS2_ESYS_RC_BAD_VALUE if an illegal hash algorithm value is stored
+ *         in a session.
+ */
 TSS2_RC
 iesys_gen_caller_nonces(ESYS_CONTEXT * esys_context)
 {
@@ -453,21 +571,30 @@ iesys_gen_caller_nonces(ESYS_CONTEXT * esys_context)
     }
     return TSS2_RC_SUCCESS;
 }
-
+/** Parameter encryption with AES or XOR obfuscation.
+ *
+ * One parameter of a TPM command will be encrypted with the selected method.
+ * The buffer to encrypted is determined with the SAPI function:
+ * Tss2_Sys_GetCpBuffer. If more than one encryption session es used an error
+ * will be returned. The decryption nonce of the session used for encryption
+ * will be returned and used for HMAC computation. The encryption key is
+ * derived with KDFa.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_encrypt_param(ESYS_CONTEXT * esys_context,
                     TPM2B_NONCE ** decryptNonce, int *decryptNonceIdx)
 {
-    uint8_t ccBuffer[4];
-    const uint8_t *cpBuffer;
-    size_t cpBuffer_size;
     TPM2B_NONCE *encryptNonce = NULL;
-    TSS2_RC r = Tss2_Sys_GetCommandCode(esys_context->sys, &ccBuffer[0]);
-    return_if_error(r, "Error: get command code");
     *decryptNonceIdx = 0;
     *decryptNonce = NULL;
-    r = Tss2_Sys_GetCpBuffer(esys_context->sys, &cpBuffer_size, &cpBuffer);
-    return_if_error(r, "Error: get cp buffer");
+    TSS2_RC r = TSS2_RC_SUCCESS;
+
     for (int i = 0; i < 3; i++) {
         RSRC_NODE_T *session = esys_context->session_tab[i];
         if (session == NULL)
@@ -481,6 +608,8 @@ iesys_encrypt_param(ESYS_CONTEXT * esys_context,
             encryptNonce = &rsrc_session->nonceTPM;
             esys_context->encryptNonce = encryptNonce;
         }
+
+        /* Session for encryption found */
         if (rsrc_session->sessionAttributes & TPMA_SESSION_DECRYPT) {
             return_if_notnull(*decryptNonce, "More than one decrypt session",
                                TSS2_ESYS_RC_MULTIPLE_DECRYPT_SESSIONS);
@@ -497,11 +626,16 @@ iesys_encrypt_param(ESYS_CONTEXT * esys_context,
             const uint8_t *paramBuffer;
             r = Tss2_Sys_GetDecryptParam(esys_context->sys, &paramSize,
                                          &paramBuffer);
-            return_if_error(r, "Encrypt parameter not possible");
+            return_if_error(r, "Encryption not possible");
+
+            if (paramSize == 0)
+                continue;
 
             BYTE encrypt_buffer[paramSize];
             memcpy(&encrypt_buffer[0], paramBuffer, paramSize);
             LOGBLOB_DEBUG(paramBuffer, paramSize, "param to encrypt");
+
+            /* AES encryption with key derived with KDFa */
             if (symDef->algorithm == TPM2_ALG_AES) {
                 if (symDef->mode.aes != TPM2_ALG_CFB) {
                     return_error(TSS2_ESYS_RC_BAD_VALUE,
@@ -523,14 +657,11 @@ iesys_encrypt_param(ESYS_CONTEXT * esys_context,
                                                  symDef->mode.aes,
                                                  AES_BLOCK_SIZE_IN_BYTES,
                                                  &encrypt_buffer[0], paramSize,
-                                                 &symKey[aes_off],
-                                                 AES_BLOCK_SIZE_IN_BYTES);
+                                                 &symKey[aes_off]);
                 return_if_error(r, "AES encryption not possible");
-                r = Tss2_Sys_SetDecryptParam(esys_context->sys, paramSize,
-                                             &encrypt_buffer[0]);
-                return_if_error(r, "Set encrypt parameter not possible");
-
-            } else if (symDef->algorithm == TPM2_ALG_XOR) {
+            }
+            /* XOR obfuscation of parameter */
+            else if (symDef->algorithm == TPM2_ALG_XOR) {
                 r = iesys_xor_parameter_obfuscation(rsrc_session->authHash,
                                                     &rsrc_session->sessionValue[0],
                                                     rsrc_session->sizeSessionValue,
@@ -539,20 +670,34 @@ iesys_encrypt_param(ESYS_CONTEXT * esys_context,
                                                     &encrypt_buffer[0],
                                                     paramSize);
                 return_if_error(r, "XOR obfuscation not possible.");
-                r = Tss2_Sys_SetDecryptParam(esys_context->sys, paramSize,
-                                             &encrypt_buffer[0]);
-                return_if_error(r, "Set encrypt parameter not possible");
-
             } else {
                 return_error(TSS2_ESYS_RC_BAD_VALUE,
                              "Invalid symmetric algorithm (should be XOR or AES)");
             }
+            r = Tss2_Sys_SetDecryptParam(esys_context->sys, paramSize,
+                                         &encrypt_buffer[0]);
+            return_if_error(r, "Set encrypt parameter not possible");
         }
     }
     return r;
 }
 
-TSS2_RC
+/** Parameter decryption with AES or XOR obfuscation.
+ *
+ * One parameter of a TPM response will be decrypted with the selected method.
+ * @param[in]  esys_context The ESYS_CONTEXT.
+ * @param[in,out] rpBuffer The buffer to be encrypted. The ecrypted data will be
+ *                overridden by the result.
+ * @param[in] rpBuffer_size The size of the encrypted data buffer.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
+ TSS2_RC
 iesys_decrypt_param(ESYS_CONTEXT * esys_context,
                     const uint8_t * rpBuffer, size_t rpBuffer_size)
 {
@@ -577,7 +722,10 @@ iesys_decrypt_param(ESYS_CONTEXT * esys_context,
                      "Invalid length encrypted response.");
     }
     LOGBLOB_DEBUG(rpBuffer, p2BSize, "IESYS encrypt data");
+
     if (symDef->algorithm == TPM2_ALG_AES) {
+
+        /* Parameter decryption with a symmetric AES key derived by KDFa */
         if (symDef->mode.aes != TPM2_ALG_CFB) {
             return_error(TSS2_ESYS_RC_BAD_VALUE,
                          "Invalid symmetric mode (must be CFB)");
@@ -607,11 +755,12 @@ iesys_decrypt_param(ESYS_CONTEXT * esys_context,
                                      symDef->mode.aes,
                                      AES_BLOCK_SIZE_IN_BYTES,
                                      (uint8_t *) & rpBuffer[2], p2BSize,
-                                     &symKey[aes_off],
-                                     AES_BLOCK_SIZE_IN_BYTES);
+                                     &symKey[aes_off]);
         return_if_error(r, "Decryption error");
 
     } else if (symDef->algorithm == TPM2_ALG_XOR) {
+
+        /* Parameter decryption with XOR obfuscation */
         r = iesys_xor_parameter_obfuscation(rsrc_session->authHash,
                                             &rsrc_session->sessionValue[0],
                                             rsrc_session->sizeSessionValue,
@@ -628,57 +777,87 @@ iesys_decrypt_param(ESYS_CONTEXT * esys_context,
     return TSS2_RC_SUCCESS;
 }
 
+/** Check the HMAC values of the response for all sessions.
+ *
+ * The HMAC values are computed based on the session secrets, the used nonces,
+ * the session attributes, the response hash.
+ * @param[in] esys_context The ESYS_CONTEXT.
+ * @param[in] rspAuths The list of the session auth values.
+ * @param[in] rp_hashtab  The list of response hashes.
+ * @param[in] rpHashNum The number of response hashes.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if hash algorithm is not implemented.
+ */
 TSS2_RC
 iesys_check_rp_hmacs(ESYS_CONTEXT * esys_context,
                      TSS2L_SYS_AUTH_RESPONSE * rspAuths,
-                     HASH_TAB_ITEM rp_hash_tab[3])
+                     HASH_TAB_ITEM rp_hash_tab[3],
+                     uint8_t rpHashNum)
 {
+    TSS2_RC r;
+
     for (int i = 0; i < rspAuths->count; i++) {
         RSRC_NODE_T *session = esys_context->session_tab[i];
-        if (session != NULL) {
-            IESYS_SESSION *rsrc_session = &session->rsrc.misc.rsrc_session;
-            if (rsrc_session->type_policy_session == POLICY_PASSWORD) {
-                if (rspAuths->auths[i].hmac.size  != 0) {
-                    LOG_ERROR("Error: hmac size not equal 0 in response.");
-                    return TSS2_ESYS_RC_BAD_VALUE;
-                }
-                return TSS2_RC_SUCCESS;
-            }
+        if (session == NULL)
+            continue;
 
-            int hi = 0;
-            for (int j = 0; j < 3; j++) {
-                if (rsrc_session->authHash == rp_hash_tab[j].alg) {
-                    hi = j;
-                    break;
-                }
+        IESYS_SESSION *rsrc_session = &session->rsrc.misc.rsrc_session;
+        if (rsrc_session->type_policy_session == POLICY_PASSWORD) {
+            /* A policy password session has no auth value */
+            if (rspAuths->auths[i].hmac.size != 0) {
+                LOG_ERROR("PolicyPassword session's HMAC must be 0-length.");
+                return TSS2_ESYS_RC_RSP_AUTH_FAILED;
             }
-            TPM2B_AUTH rp_hmac;
-            rp_hmac.size = sizeof(TPMU_HA);
-            rsrc_session->nonceTPM = rspAuths->auths[i].nonce;
-            rsrc_session->sessionAttributes =
-                rspAuths->auths[i].sessionAttributes;
-            // TODO check: auths.auths[i].hmac.size =  sizeof(TPMU_HA);
-            TSS2_RC r =
-                iesys_crypto_authHmac(rsrc_session->authHash,
-                                      &rsrc_session->sessionValue[0],
-                                      rsrc_session->sizeSessionValue,
-                                      &rp_hash_tab[hi].digest[0],
-                                      rp_hash_tab[hi].size,
-                                      &rsrc_session->nonceTPM,
-                                      &rsrc_session->nonceCaller, NULL, NULL,
-                                      rspAuths->auths[i].sessionAttributes,
-                                      &rp_hmac);
-            return_if_error(r, "HMAC error");
-            if (!cmp_TPM2B_AUTH(&rspAuths->auths[i].hmac, &rp_hmac)) {
-                LOG_ERROR("Error: Invalid hmac response.");
-                return TSS2_ESYS_RC_BAD_VALUE;
-            }
+            continue;
         }
 
+        /* Find the rpHash for the hash algorithm used by this session */
+        int hi;
+        for (hi = 0; hi < rpHashNum; hi++) {
+            if (rsrc_session->authHash == rp_hash_tab[hi].alg) {
+                break;
+            }
+        }
+        if (hi == rpHashNum) {
+            LOG_ERROR("rpHash for alg %"PRIx16 " not found.",
+                      rsrc_session->authHash);
+            return TSS2_ESYS_RC_GENERAL_FAILURE;
+        }
+
+        TPM2B_AUTH rp_hmac;
+        rp_hmac.size = sizeof(TPMU_HA);
+        rsrc_session->nonceTPM = rspAuths->auths[i].nonce;
+        rsrc_session->sessionAttributes =
+            rspAuths->auths[i].sessionAttributes;
+        r = iesys_crypto_authHmac(rsrc_session->authHash,
+                                  &rsrc_session->sessionValue[0],
+                                  rsrc_session->sizeHmacValue,
+                                  &rp_hash_tab[hi].digest[0],
+                                  rp_hash_tab[hi].size,
+                                  &rsrc_session->nonceTPM,
+                                  &rsrc_session->nonceCaller, NULL, NULL,
+                                  rspAuths->auths[i].sessionAttributes,
+                                  &rp_hmac);
+        return_if_error(r, "HMAC error");
+
+        if (!cmp_TPM2B_AUTH(&rspAuths->auths[i].hmac, &rp_hmac)) {
+            LOG_ERROR("TPM's response auth is invalid for session %i", i);
+            return TSS2_ESYS_RC_RSP_AUTH_FAILED;
+        }
     }
     return TSS2_RC_SUCCESS;
 }
-
+/** Compute the value for check of bind authorization.
+ *
+ * This value has to be computed from the bind object in the StartAuthSession
+ * command and later checked in for corresponding object authorizations.
+ * @param[in] name The name of the bind object.
+ * @param[in] auth The authorization of the bind object.
+ * @param[out] bound_entity The value used for checking the bind authorization.
+ */
 void
 iesys_compute_bound_entity(const TPM2B_NAME * name,
                            const TPM2B_AUTH * auth, TPM2B_NAME * bound_entity)
@@ -694,25 +873,44 @@ iesys_compute_bound_entity(const TPM2B_NAME * name,
     bound_entity->size = sizeof(bound_entity->name);
 }
 
+/** Predicate whether the authorization is for the object bound to the session.
+ *
+ * @param[in] name The name of the object.
+ * @param[in] auth The auth value of the object.
+ * @param[in] sesssion The session to be checked.
+ * @retval true if object is bind object of session.
+ * @retval false if not.
+ */
 bool
 iesys_is_object_bound(const TPM2B_NAME * name,
-                      const TPM2B_AUTH * auth, const TPM2B_NAME * bound_entity)
+                      const TPM2B_AUTH * auth, RSRC_NODE_T * session)
 {
     TPM2B_NAME tmp;
+    if (session->rsrc.misc.rsrc_session.bound_entity.size == 0)
+        /* No bind session */
+        return false;
     iesys_compute_bound_entity(name, auth, &tmp);
-    return cmp_TPM2B_NAME(bound_entity, &tmp);
+    return cmp_TPM2B_NAME(&session->rsrc.misc.rsrc_session.bound_entity, &tmp);
 }
 
 /**
  * Compute the session value
  *
  * This function derives the session value from the session key
- * and the auth value.
+ * and the auth value. The auth value is appended to the session key.
+ * The session value is used for key derivation for parameter encryption and
+ * HMAC computation. There is one exception for HMAC key derivation: If the
+ * session is bound to an object only the session key is used. The auth value
+ * is appended only for the key used for parameter encryption.
  * The auth value is only used if an authorization is necessary and the name
  * of the object is not equal to the name of an used bound entity
- * @param[in] session for which the session value will be computed
+ * @param[in,out] session for which the session value will be computed.
+ *       The value will be stored in sessionValue of the session object.
+ *       The length of the object will be stored in sizeHmacValue and
+ *       sizeSessionValue respectively to the purpose of usage (HMAC computation
+ *       or parameter encryption).
  * @param[in] name name of the object to be authorized (NULL if no authorization)
- * @param[in] auth-value auth value of the object to be authorized
+ * @param[in] auth_value auth value of the object to be authorized
  *             (NULL if no authorization)
  */
 void
@@ -730,24 +928,30 @@ iesys_compute_session_value(RSRC_NODE_T * session,
            &session->rsrc.misc.rsrc_session.sessionKey.buffer[0],
            session->rsrc.misc.rsrc_session.sessionKey.size);
 
-    /* Then if we are a bound session, the auth value is appended to the end
-       of the session value. */
     if (name == NULL)
         return;
     /* This requires an HMAC Session and not a password session */
     if (session->rsrc.misc.rsrc_session.sessionType != TPM2_SE_HMAC &&
         session->rsrc.misc.rsrc_session.sessionType != TPM2_SE_POLICY)
         return;
-    if (iesys_is_object_bound(name, auth_value,
-                              &session->rsrc.misc.rsrc_session.bound_entity) &&
-        /* type_policy_session set to POLICY_AUTH by command PolicyAuthValue */
-        (session->rsrc.misc.rsrc_session.type_policy_session != POLICY_AUTH))
-        return;
 
+    session->rsrc.misc.rsrc_session.sizeHmacValue = session->rsrc.misc.rsrc_session.sizeSessionValue;
+
+    /* The auth value is appended to the session key */
     memcpy(&session->rsrc.misc.rsrc_session.
            sessionValue[session->rsrc.misc.rsrc_session.sessionKey.size],
            &auth_value->buffer[0], auth_value->size);
     session->rsrc.misc.rsrc_session.sizeSessionValue += auth_value->size;
+
+    /* Then if we are a bound session, the auth value is not appended to the end
+       of the session value for HMAC computation. The size of the key will not be
+       increased.*/
+   if (iesys_is_object_bound(name, auth_value,
+                              session) &&
+        /* type_policy_session set to POLICY_AUTH by command PolicyAuthValue */
+        (session->rsrc.misc.rsrc_session.type_policy_session != POLICY_AUTH))
+        return;
+   session->rsrc.misc.rsrc_session.sizeHmacValue += auth_value->size;
 }
 
 /**
@@ -763,8 +967,10 @@ iesys_compute_session_value(RSRC_NODE_T * session,
  * @param[in,out] esys_context The esys context to issue the command on.
  * @param[in] esys_handle The handle to find the corresponding object for.
  * @param[out] esys_object The object containing the name, tpm handle and auth value
- * @returns TSS2_RC_SUCCESS on success
- *          TSS2_ESYS_RC_BAD_TR if the handle is invalid
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_BAD_TR if the handle is invalid.
+ * @retval TSS2_ESYS_RC_BAD_VALUE if an unknown handle < ESYS_TR_MIN_OBJECT is
+ *         passed.
  */
 TSS2_RC
 esys_GetResourceObject(ESYS_CONTEXT * esys_context,
@@ -821,7 +1027,7 @@ esys_GetResourceObject(ESYS_CONTEXT * esys_context,
                                 &esys_object_aux->rsrc.name.name[0],
                                 sizeof(esys_object_aux->rsrc.name.name),
                                 &offset);
-    return_if_error(r, "Marshalling TPM handle.");
+    return_if_error(r, "Marshaling TPM handle.");
 
     esys_object_aux->rsrc.name.size = offset;
     *esys_object = esys_object_aux;
@@ -836,8 +1042,8 @@ esys_GetResourceObject(ESYS_CONTEXT * esys_context,
  * @state field is either @_ESYS_STATE_INIT, @_ESYS_STATE_ERRORRESPONSE,
  * @_ESYS_STATE_FINISHED.
  * @param[in,out] esys_context The esys context to issue the command on.
- * @returns TSS2_RC_SUCCESS on success
- *          TSS2_RC_BAD_SEQUENCE if context is not ready for this function
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_RC_BAD_SEQUENCE if context is not ready for this function.
  */
 TSS2_RC
 iesys_check_sequence_async(ESYS_CONTEXT * esys_context)
@@ -852,7 +1058,7 @@ iesys_check_sequence_async(ESYS_CONTEXT * esys_context)
         LOG_ERROR("Esys called in bad sequence.");
         return TSS2_ESYS_RC_BAD_SEQUENCE;
     }
-//TODO: Check if RESUBMISSION BELONGS HERE OR RATHER INTO THE FINISH METHOD.
+    /* TODO: Check if RESUBMISSION BELONGS HERE OR IN THE FINISH METHOD. */
     if (esys_context->state == _ESYS_STATE_RESUBMISSION) {
         esys_context->submissionCount++;
         LOG_DEBUG("The command will be resubmitted for the %i time.",
@@ -863,6 +1069,12 @@ iesys_check_sequence_async(ESYS_CONTEXT * esys_context)
     return TSS2_RC_SUCCESS;
 }
 
+/** Check whether session without authorization occurs before one with.
+ *
+ * @param[in] session1-3 The three sessions.
+ * @retval TPM2_RC_SUCCESS if the order is ok.
+ * @retval TSS2_ESYS_RC_BAD_VALUE if not.
+ */
 TSS2_RC
 check_session_feasibility(ESYS_TR shandle1, ESYS_TR shandle2, ESYS_TR shandle3,
                           int mandatory)
@@ -890,12 +1102,35 @@ check_session_feasibility(ESYS_TR shandle1, ESYS_TR shandle2, ESYS_TR shandle3,
     return TPM2_RC_SUCCESS;
 }
 
+/** Compute HMAC for a session.
+ *
+ * The HMAC is computed from the appropriate cp hash, the caller nonce, the TPM
+ * nonce and the session attributes. If an encrypt session is not the first
+ * session also the encrypt and the decrypt nonce have to be included.
+ * @param[in] session The session for which the HMAC has to be computed.
+ * @param[in] cp_hash_tab The table of computed cp hash values.
+ * @param[in] cpHashNum The number of computed cp hash values which depens on
+ *            the number of used hash algorithms.
+ * @param[in] encryptNonce The encrypt Nonce of an encryption session. Has to
+ *            be NULL if encryption session is first session.
+ * @param[in] decryptNonce The decrypt Nonce of an encryption session. Has to
+ *            be NULL if encryption session is first session.
+ * @param[out] auth The computed HMAC value.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
-iesys_compute_hmacs(RSRC_NODE_T * session,
-                    HASH_TAB_ITEM cp_hash_tab[3],
-                    uint8_t cpHashNum,
-                    TPM2B_NONCE * decryptNonce,
-                    TPM2B_NONCE * encryptNonce, TPMS_AUTH_COMMAND * auth)
+iesys_compute_hmac(RSRC_NODE_T * session,
+                   HASH_TAB_ITEM cp_hash_tab[3],
+                   uint8_t cpHashNum,
+                   TPM2B_NONCE * decryptNonce,
+                   TPM2B_NONCE * encryptNonce,
+                   TPMS_AUTH_COMMAND * auth)
 {
     TSS2_RC r;
     size_t authHash_size = 0;
@@ -919,7 +1154,7 @@ iesys_compute_hmacs(RSRC_NODE_T * session,
            computation of the first session */
         r = iesys_crypto_authHmac(rsrc_session->authHash,
                                   &rsrc_session->sessionValue[0],
-                                  rsrc_session->sizeSessionValue,
+                                  rsrc_session->sizeHmacValue,
                                   &cp_hash_tab[hi].digest[0],
                                   cp_hash_tab[hi].size,
                                   &rsrc_session->nonceCaller,
@@ -935,6 +1170,22 @@ iesys_compute_hmacs(RSRC_NODE_T * session,
     return TSS2_RC_SUCCESS;
 }
 
+/** Compute the auth values (HMACs) for all sessions.
+ *
+ * The caller nonce, the encrypt nonces, the cp hashes, and the HMAC values for
+ * the command authorization are computed.
+ * @param[in] esys_context The esys context to issue the command on.
+ * @param[in] h1-3 The esys session resource objects.
+ * @param[out] The list if the authorizations with teh computed HMACs.
+ * @param[out] auth The computed HMAC value.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_gen_auths(ESYS_CONTEXT * esys_context,
                 RSRC_NODE_T * h1,
@@ -1000,13 +1251,13 @@ iesys_gen_auths(ESYS_CONTEXT * esys_context,
                 continue;
             }
         }
-        r = iesys_compute_hmacs(esys_context->session_tab[session_idx],
-                                &cp_hash_tab[0], cpHashNum,
-                                (session_idx == 0
-                                 && decryptNonceIdx > 0) ? decryptNonce : NULL,
-                                (session_idx == 0
-                                 && encryptNonceIdx > 0) ? encryptNonce : NULL,
-                                &auths->auths[session_idx]);
+        r = iesys_compute_hmac(esys_context->session_tab[session_idx],
+                               &cp_hash_tab[0], cpHashNum,
+                               (session_idx == 0
+                                && decryptNonceIdx > 0) ? decryptNonce : NULL,
+                               (session_idx == 0
+                                && encryptNonceIdx > 0) ? encryptNonce : NULL,
+                               &auths->auths[session_idx]);
         return_if_error(r, "Error while computing hmacs");
         if (esys_context->session_tab[session_idx] != NULL) {
             auths->auths[auths->count].sessionHandle = session->rsrc.handle;
@@ -1020,6 +1271,21 @@ iesys_gen_auths(ESYS_CONTEXT * esys_context,
     return TSS2_RC_SUCCESS;
 }
 
+/** Check the response HMACs for all sessions.
+ *
+ * The response HMAC values are computed. Based on these values the HMACs for
+ * all sessions are computed and compared with the HMACs stored in the response
+ * auth list which is determined with the SAPI function Tss2_Sys_GetRspAuths.
+ * @param[in] esys_context The esys context which is used to get the response
+ * auth values and the sessions.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_check_response(ESYS_CONTEXT * esys_context)
 {
@@ -1055,11 +1321,12 @@ iesys_check_response(ESYS_CONTEXT * esys_context)
         return_if_error(r, "Error: get rp buffer");
 
         r = iesys_compute_rp_hashtab(esys_context,
-                                     &rspAuths, rpBuffer, rpBuffer_size,
+                                     rpBuffer, rpBuffer_size,
                                      &rp_hash_tab[0], &rpHashNum);
         return_if_error(r, "Error: while computing response hashes");
 
-        r = iesys_check_rp_hmacs(esys_context, &rspAuths, &rp_hash_tab[0]);
+        r = iesys_check_rp_hmacs(esys_context, &rspAuths, &rp_hash_tab[0],
+                                 rpHashNum);
         return_if_error(r, "Error: response hmac check");
 
         if (esys_context->encryptNonce != NULL) {
@@ -1070,6 +1337,20 @@ iesys_check_response(ESYS_CONTEXT * esys_context)
     return TSS2_RC_SUCCESS;
 }
 
+/** Compute the name from the public data of a NV index.
+ *
+ * The name of a NV index is computed as follows:
+ *   name =  nameAlg||Hash(nameAlg,marshal(publicArea))
+ * @param[in] publicInfo The public information of the NV index.
+ * @param[out] name The computed name.
+ * @retval TSS2_RC_SUCCESS on success.
+ * @retval TSS2_ESYS_RC_MEMORY Memory can not be allocated.
+ * @retval TSS2_ESYS_RC_BAD_VALUE for invalid parameters.
+ * @retval TSS2_ESYS_RC_BAD_REFERENCE for unexpected NULL pointer parameters.
+ * @retval TSS2_ESYS_RC_GENERAL_FAILURE for errors of the crypto library.
+ * @retval TSS2_ESYS_RC_NOT_IMPLEMENTED if hash algorithm is not implemented.
+ * @retval TSS2_SYS_RC_* for SAPI errors.
+ */
 TSS2_RC
 iesys_nv_get_name(TPM2B_NV_PUBLIC * publicInfo, TPM2B_NAME * name)
 {
@@ -1109,6 +1390,16 @@ iesys_nv_get_name(TPM2B_NV_PUBLIC * publicInfo, TPM2B_NAME * name)
     return TSS2_RC_SUCCESS;
 }
 
+/** Compute the name of a TPM transient or persistent object.
+ *
+ * The name of a NV index is computed as follows:
+ *   name = Hash(nameAlg,marshal(publicArea))
+ * @param[in] publicInfo The public information of the TPM object.
+ * @param[out] name The computed name.
+ * @retval TPM2_RC_SUCCESS  or one of the possible errors TSS2_ESYS_RC_BAD_VALUE,
+ * TSS2_ESYS_RC_MEMORY, TSS2_ESYS_RC_GENERAL_FAILURE, TSS2_ESYS_RC_NOT_IMPLEMENTED,
+ * or return codes of SAPI errors.
+ */
 TSS2_RC
 iesys_get_name(TPM2B_PUBLIC * publicInfo, TPM2B_NAME * name)
 {

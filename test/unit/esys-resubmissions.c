@@ -469,7 +469,6 @@ test_StartAuthSession(void **state)
     };
     TPMI_ALG_HASH authHash = TPM2_ALG_SHA1;
     ESYS_TR sessionHandle_handle;
-    TPM2B_NONCE *nonceTPM;
 
     r = Esys_StartAuthSession(esys_context,
                               tpmKey_handle,
@@ -480,7 +479,7 @@ test_StartAuthSession(void **state)
                               &nonceCaller,
                               sessionType,
                               &symmetric,
-                              authHash, &sessionHandle_handle, &nonceTPM);
+                              authHash, &sessionHandle_handle);
 
     assert_int_equal(r, TPM2_RC_YIELDED);
     assert_int_equal(tcti_yielder->count, 5 /* _ESYS_MAX_SUBMISSIONS */ );
@@ -1754,13 +1753,14 @@ test_PolicyLocality(void **state)
     ESYS_CONTEXT *esys_context = (ESYS_CONTEXT *) * state;
     Esys_GetTcti(esys_context, &tcti);
     TSS2_TCTI_CONTEXT_YIELDER *tcti_yielder = tcti_yielder_cast(tcti);
-
-    TPMI_SH_POLICY policySession = TPM2_POLICY_SESSION_FIRST;
+    ESYS_TR policySession_handle = DUMMY_TR_HANDLE_POLICY_SESSION;
     TPMA_LOCALITY locality = TPMA_LOCALITY_TPM2_LOC_ZERO;
     r = Esys_PolicyLocality(esys_context,
+                            policySession_handle,
                             ESYS_TR_NONE,
                             ESYS_TR_NONE,
-                            ESYS_TR_NONE, policySession, locality);
+                            ESYS_TR_NONE,
+                            locality);
 
     assert_int_equal(r, TPM2_RC_YIELDED);
     assert_int_equal(tcti_yielder->count, 5 /* _ESYS_MAX_SUBMISSIONS */ );
